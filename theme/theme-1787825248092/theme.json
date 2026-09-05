@@ -1,0 +1,20 @@
+{
+  "id": "theme-1787825248092",
+  "name": "theme-1787825248092",
+  "description": "",
+  "version": "1.0.0",
+  "author": "Admin",
+  "created": "2026-08-27",
+  "type": "dark",
+  "layout": "layout.html",
+  "stylesheet": "app.css",
+  "tokens": {
+    "colors": {
+      "accent": "#ffcf4d",
+      "accent2": "#3ddc84",
+      "bg": "#000000"
+    }
+  },
+  "components": {},
+  "stars": {}
+}

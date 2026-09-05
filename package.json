@@ -1,0 +1,23 @@
+{
+  "name": "video-generator-platform",
+  "version": "1.0.0",
+  "description": "AI 视频生成与编辑平台 — 资产库 / 图生视频 / 风格库 / 分集管理 / 后台管理",
+  "type": "commonjs",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node server/index.js",
+    "seed": "node server/seed.js",
+    "theme:export": "node tools/theme-export.js",
+    "theme:apply": "node tools/theme-apply.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "express": "^4.19.2",
+    "ffmpeg-static": "^5.2.0",
+    "multer": "^2.2.0"
+  }
+}

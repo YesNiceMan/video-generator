@@ -1,0 +1,8 @@
+node_modules/
+data/
+test/shots/
+.npm-cache/
+.brew-cache/
+tools/
+tmp/
+*.log

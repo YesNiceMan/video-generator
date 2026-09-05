@@ -1,0 +1,14 @@
+{
+  "id": "0001",
+  "name": "鎏金胶片",
+  "description": "影棚纯黑背景 · 鎏金主色 · 胶片颗粒质感 · 取景框悬停 · 衬线标题 —— 十六·1 全站重设计",
+  "version": "1.0.0",
+  "author": "VideoForge Studio",
+  "created": "2026-08-28",
+  "type": "dark",
+  "layout": "layout.html",
+  "stylesheet": "app.css",
+  "tokens": {},
+  "components": {},
+  "stars": {}
+}

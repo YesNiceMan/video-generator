@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark light">
+  <title>视界引擎 · AI 视频创作平台</title>
+  <script>
+  /* 十八·2 浅色模式:首帧前确定配色方案(localStorage > 跟随系统),避免加载闪烁 */
+  (function () {
+    var scheme = 'light';
+    try {
+      var saved = localStorage.getItem('vf-scheme');
+      if (saved === 'light' || saved === 'dark') scheme = saved;
+      else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) scheme = 'light';
+    } catch (e) { /* 隐私模式等场景下静默回退深色 */ }
+    document.documentElement.dataset.scheme = scheme;
+  })();
+  </script>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 64 64%27%3E%3Cdefs%3E%3ClinearGradient id=%27g%27 x1=%270%27 y1=%270%27 x2=%271%27 y2=%271%27%3E%3Cstop offset=%270%27 stop-color=%27%23f4dcab%27/%3E%3Cstop offset=%271%27 stop-color=%27%23b8842e%27/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width=%2764%27 height=%2764%27 rx=%2714%27 fill=%27%230b0a08%27/%3E%3Ccircle cx=%2732%27 cy=%2732%27 r=%2717%27 fill=%27none%27 stroke=%27url(%23g)%27 stroke-width=%274%27/%3E%3Ccircle cx=%2732%27 cy=%2732%27 r=%275.5%27 fill=%27url(%23g)%27/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+  <!-- 极光氛围层(纯装饰) -->
+  <div class="bg-aurora" aria-hidden="true">
+    <span class="bg-orb bg-orb-1"></span>
+    <span class="bg-orb bg-orb-2"></span>
+    <span class="bg-orb bg-orb-3"></span>
+  </div>
+
+  <div id="app" class="app hidden">
+    <!-- 主区域(功能入口集中在顶栏导航;首页已展示全部功能) -->
+    <div class="main">
+      <header class="topbar">
+        <div class="topbar-left">
+          <div class="brand" id="brandBox">
+            <div class="brand-logo"><i data-lucide="clapperboard"></i></div>
+            <div class="brand-text">
+              <div class="brand-name">视界引擎</div>
+              <div class="brand-sub">VideoForge Studio</div>
+            </div>
+          </div>
+          <!-- 主导航 -->
+          <nav class="top-nav" id="topNav">
+            <a class="top-link" data-route="/" href="#/"><i data-lucide="layout-dashboard"></i><span>首页</span></a>
+            <a class="top-link" data-route="/projects" href="#/projects"><i data-lucide="film"></i><span>项目分集</span></a>
+            <a class="top-link" data-route="/assets" href="#/assets"><i data-lucide="folder-open"></i><span>资产库</span></a>
+            <a class="top-link" data-route="/styles" href="#/styles"><i data-lucide="palette"></i><span>风格库</span></a>
+            <a class="top-link nav-admin" data-route="/admin" href="#/admin" style="display:none"><i data-lucide="settings"></i><span>后台管理</span></a>
+          </nav>
+        </div>
+        <div class="topbar-title" id="pageTitle">首页</div>
+        <div class="topbar-right">
+          <!-- 配色模式切换:深色时展示「切到浅色」的太阳,浅色时展示月亮 -->
+          <button class="icon-btn topbar-btn" id="schemeBtn" title="切换浅色 / 深色模式">
+            <i data-lucide="sun-medium" class="scheme-ico-sun"></i>
+            <i data-lucide="moon" class="scheme-ico-moon"></i>
+          </button>
+          <button class="cmdk-trigger" id="cmdkBtn" title="快速搜索 · 命令面板 (Ctrl+K)">
+            <i data-lucide="command"></i>
+            <span class="cmdk-t-label">快速操作</span>
+            <span class="cmdk-t-kbd"><kbd class="kbd">Ctrl</kbd><kbd class="kbd">K</kbd></span>
+          </button>
+          <!-- 积分芯片 -->
+          <button class="credit-chip" id="creditChip" title="积分中心">
+            <i data-lucide="coins"></i><b id="creditChipVal">—</b>
+          </button>
+          <!-- 项目切换器 -->
+          <div class="proj-switch" id="projSwitch">
+            <button class="proj-switch-btn" id="projSwitchBtn" title="切换项目">
+              <span class="ps-ico"><i data-lucide="film"></i></span>
+              <span class="ps-name" id="projSwitchName">选择项目</span>
+              <span class="ps-caret"><i data-lucide="chevron-down"></i></span>
+            </button>
+            <div class="proj-switch-pop hidden" id="projSwitchPop"></div>
+          </div>
+          <button class="icon-btn topbar-btn" id="notifBtn" title="通知"><i data-lucide="bell"></i><span class="badge" id="notifBadge" style="display:none">0</span></button>
+          <div class="notif-panel hidden" id="notifPanel"></div>
+          <!-- 用户 -->
+          <div class="top-user" id="topUser">
+            <button class="top-user-btn" id="topUserBtn" title="账号">
+              <span class="avatar tu-avatar" id="topAvatar">U</span>
+              <span class="tu-name" id="topUserName">—</span>
+              <span class="tu-caret"><i data-lucide="chevron-down"></i></span>
+            </button>
+            <div class="top-user-pop hidden" id="topUserPop">
+              <div class="tu-pop-head">
+                <div class="tu-pop-name" id="tuName">—</div>
+                <div class="tu-pop-role" id="tuRole">普通用户</div>
+                <div class="tu-pop-storage">
+                  <div class="storage-label"><span>存储空间</span><span id="tuStorage">0 / 0 GB</span></div>
+                  <div class="storage-bar"><div class="storage-fill" id="tuStorageFill"></div></div>
+                </div>
+              </div>
+              <a class="tu-pop-item" href="#/"><i data-lucide="home"></i>返回仪表盘</a>
+              <a class="tu-pop-item" href="#/projects"><i data-lucide="film"></i>项目分集</a>
+              <a class="tu-pop-item" href="#/assets"><i data-lucide="folder-open"></i>资产库</a>
+              <button class="tu-pop-item" id="creditCenterBtn"><i data-lucide="coins"></i>积分中心 · <b id="tuCredits">0</b></button>
+              <button class="tu-pop-item danger" id="topLogoutBtn"><i data-lucide="log-out"></i>退出登录</button>
+            </div>
+          </div>
+        </div>
+      </header>
+      <main class="content" id="view"></main>
+    </div>
+  </div>
+
+  <div id="authRoot" class="hidden"></div>
+  <div id="modalRoot"></div>
+  <div id="toastRoot"></div>
+
+  <script src="/vendor/lucide.min.js"></script>
+  <script src="/js/api.js"></script>
+  <script src="/js/ui.js"></script>
+  <script src="/js/icons.js"></script>
+  <script src="/js/plink.js"></script>
+  <script src="/js/credits.js"></script>
+  <script src="/js/views/auth.js"></script>
+  <script src="/js/views/dashboard.js"></script>
+  <script src="/js/views/assets.js"></script>
+  <script src="/js/views/styles.js"></script>
+  <script src="/js/views/projects.js"></script>
+  <script src="/js/views/admin.js"></script>
+  <script src="/js/cmdk.js"></script>
+  <script src="/js/app.js"></script>
+</body>
+</html>
