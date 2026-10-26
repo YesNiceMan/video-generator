@@ -88,7 +88,8 @@ const upload = multer({
 });
 
 function assetJSON(a) {
-  return { ...a, tags: JSON.parse(a.tags || '[]'), storage_path: undefined };
+  /* path 是服务器文件系统绝对路径,不回传给前端(thumb_path 除外) */
+  return { ...a, tags: JSON.parse(a.tags || '[]'), path: undefined, storage_path: undefined };
 }
 
 function assertCanRead(req, a) {
@@ -139,6 +140,10 @@ r.post('/upload', upload.single('file'), asyncRoute(async (req, res) => {
   if (type === 'video') {
     const t = path.join(THUMBS, uid('t-') + '.jpg');
     try { await makeThumb(file.path, t); thumbPath = t; } catch (e) {}
+  } else if (type === 'image') {
+    /* 第二十七轮:图片上传也生成缩略图,参考图挑选 / 引用 chips 直接可预览 */
+    const t = path.join(THUMBS, uid('t-') + '.jpg');
+    try { await makeThumb(file.path, t); thumbPath = t; } catch (e) {}
   }
   const id = uid('a-');
   const finalPath = path.join(UPLOADS, req.user.id, id + '.' + (EXT_BY_MIME[file.mimetype] || 'bin'));
@@ -159,37 +164,57 @@ r.post('/upload', upload.single('file'), asyncRoute(async (req, res) => {
 }));
 
 // 用户可访问的资产列表(自己 + 共享给我的)
+// limit/offset 分页(limit=0 或缺省 = 返回全部,供分镜工作台等内部聚合方使用);
+// 无论是否分页都返回 total = 当前筛选条件下的总数,前端据此分页
 r.get('/', asyncRoute(async (req, res) => {
   const { folder_id, type, q, tag, shared } = req.query;
+  let from = 'FROM assets a';
+  let where = 'WHERE a.owner_id=?';
   const params = [req.user.id];
-  let sql = 'SELECT a.*, 0 AS is_shared FROM assets a WHERE a.owner_id=?';
-  if (folder_id === 'root') { sql += ' AND a.folder_id IS NULL'; }
-  else if (folder_id) { sql += ' AND a.folder_id=?'; params.push(folder_id); }
-  if (type && type !== 'all') { sql += ' AND a.type=?'; params.push(type); }
+  if (folder_id === 'root') { where += ' AND a.folder_id IS NULL'; }
+  else if (folder_id) { where += ' AND a.folder_id=?'; params.push(folder_id); }
+  if (type && type !== 'all') { where += ' AND a.type=?'; params.push(type); }
   // 分类筛选:category=角色/场景/… 或 category=none(未分类)
   const cat = req.query.category;
-  if (cat === 'none') { sql += " AND (a.category IS NULL OR a.category='')"; }
-  else if (cat && cat !== 'all' && CATEGORIES.includes(cat)) { sql += ' AND a.category=?'; params.push(cat); }
-  if (tag) { sql += ' AND a.tags LIKE ?'; params.push('%' + tag + '%'); }
-  if (q) { sql += ' AND a.name LIKE ?'; params.push('%' + q + '%'); }
+  if (cat === 'none') { where += " AND (a.category IS NULL OR a.category='')"; }
+  else if (cat && cat !== 'all' && CATEGORIES.includes(cat)) { where += ' AND a.category=?'; params.push(cat); }
+  if (tag) { where += ' AND a.tags LIKE ?'; params.push('%' + tag + '%'); }
+  if (q) { where += ' AND a.name LIKE ?'; params.push('%' + q + '%'); }
   if (shared === '1') {
-    sql = `SELECT a.*, 1 AS is_shared FROM assets a JOIN asset_shares sh ON sh.asset_id=a.id WHERE sh.user_id=?`;
-    params.length = 1;
-    if (q) { sql += ' AND a.name LIKE ?'; params.push('%' + q + '%'); }
+    from = 'FROM assets a JOIN asset_shares sh ON sh.asset_id=a.id';
+    where = 'WHERE sh.user_id=?';
+    if (q) where += ' AND a.name LIKE ?';
+    /* 共享视图下 params 只需 user_id + 可选的 q,重新按此顺序组装 */
+    const p2 = [req.user.id];
+    if (q) p2.push('%' + q + '%');
+    params.length = 0; params.push(...p2);
   }
-  sql += ' ORDER BY a.created_at DESC';
-  const rows = db.prepare(sql).all(...params).map(assetJSON);
+  const select = shared === '1'
+    ? `SELECT a.*, 1 AS is_shared ${from} ${where}`
+    : `SELECT a.*, 0 AS is_shared ${from} ${where}`;
+  const total = db.prepare(`SELECT COUNT(*) AS c ${from} ${where}`).get(...params).c;
+  /* limit=0 表示不分页;分页时最多 200 条,避免前端把整库拖进一次渲染 */
+  const wantLimit = req.query.limit === undefined ? 0 : Number(req.query.limit);
+  const limit = Number.isFinite(wantLimit) && wantLimit > 0 ? Math.min(Math.round(wantLimit), 200) : 0;
+  const offset = Math.max(0, Math.round(Number(req.query.offset) || 0));
+  const pageSql = select + ' ORDER BY a.created_at DESC' + (limit ? ' LIMIT ? OFFSET ?' : '');
+  const rows = db.prepare(pageSql).all(...(limit ? [...params, limit, offset] : params)).map(assetJSON);
   // 计算每项对我的权限
   const mine = new Set(db.prepare('SELECT id FROM assets WHERE owner_id=?').all(req.user.id).map(x => x.id));
   const sharedEditable = new Set(db.prepare("SELECT asset_id FROM asset_shares WHERE user_id=? AND permission='edit'").all(req.user.id).map(x => x.asset_id));
-  res.json({ items: rows.map(a => ({ ...a, my_permission: mine.has(a.id) ? 'owner' : (sharedEditable.has(a.id) ? 'edit' : 'read') })) });
+  res.json({
+    items: rows.map(a => ({ ...a, my_permission: mine.has(a.id) ? 'owner' : (sharedEditable.has(a.id) ? 'edit' : 'read') })),
+    total, limit, offset
+  });
 }));
 
 r.get('/shared-with-me', asyncRoute(async (req, res) => {
   const rows = db.prepare(`SELECT a.*, sh.permission, sh.created_at AS shared_at, u.name AS shared_by_name
     FROM asset_shares sh JOIN assets a ON sh.asset_id=a.id JOIN users u ON u.id=a.owner_id
     WHERE sh.user_id=? ORDER BY sh.created_at DESC`).all(req.user.id).map(assetJSON);
-  res.json({ items: rows });
+  /* 共享列表同样要给 my_permission,否则前端把只读共享资产也当成可编辑(显示勾选/删除按钮) */
+  const editable = new Set(db.prepare("SELECT asset_id FROM asset_shares WHERE user_id=? AND permission='edit'").all(req.user.id).map(x => x.asset_id));
+  res.json({ items: rows.map(a => ({ ...a, my_permission: editable.has(a.id) ? 'edit' : 'read' })) });
 }));
 
 // 文件夹树

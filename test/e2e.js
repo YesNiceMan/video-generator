@@ -38,13 +38,16 @@ const wait = ms => new Promise(r => setTimeout(r, ms));
   const uploadRes = curl(BASE + '/assets/upload', { form: '-F "file=@/tmp/test_e2e.png" -F "tags=test,e2e"' });
   console.log('2. 上传图片:', uploadRes.asset.id, uploadRes.asset.name);
 
-  // 3. 模型列表
+  // 3. 模型列表(动态选择可用的图生视频模型:优先免费,避免历史库无 m-svd 时崩溃)
   const models = get(BASE + '/styles/models');
   console.log('3. 模型:', models.items.map(m => m.name).join(' / '));
+  const i2v = models.items.filter(m => m.type === 'image-to-video' && m.enabled !== 0);
+  const videoModel = i2v.find(m => m.is_free) || i2v[0];
+  if (!videoModel) { console.log('❌ 无可用图生视频模型,中止'); process.exit(1); }
 
   // 4. 提交图生视频任务
   const taskRes = jpost(BASE + '/tasks', {
-    model_id: 'm-svd', use_asset_id: uploadRes.asset.id, style_id: 's-cinema',
+    model_id: videoModel.id, use_asset_id: uploadRes.asset.id,
     prompt: 'cinematic test', 'param_duration': 3, 'param_fps': 30, 'param_motion': 0.5
   });
   console.log('4. 任务提交:', taskRes.task.id, '| status:', taskRes.task.status);

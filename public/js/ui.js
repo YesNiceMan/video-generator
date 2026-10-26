@@ -73,7 +73,7 @@ function openModal({ title = '', body = '', footer = null, size = '', onClose } 
 
 function confirmDlg(message, { title = '确认操作', danger = true, okText = '确认' } = {}) {
   return new Promise(resolve => {
-    let confirmed = false; // 关键:onClose 在 m.close() 时同步触发,
+    let confirmed = false; // 关键：onClose 在 m.close() 时同步触发，
     // 若在这里无条件 resolve(false),会抢先于 resolve(true) 落定 Promise,
     // 表现为「点确认后什么都不执行」(如批量审片删除记录)。改为按结果落定。
     const okBtn = el(`<button class="btn ${danger ? 'btn-danger' : 'btn-primary'}">${esc(okText)}</button>`);
@@ -140,28 +140,33 @@ function statusBadge(status) {
   return `<span class="status status-${status}">${dot}${map[status] || status}</span>`;
 }
 
+/* 网关排队已满的延后重投:轮询签名里没有 next_at,列表不会为此重绘,
+   所以用一个 1 秒定时器只改 [data-wait-until] 文案节点(整表重绘会打断输入) */
+function ensureWaitCountdown(holder, root) {
+  if (!holder || !root) return;
+  const nodes = root.querySelectorAll('[data-wait-until]');
+  if (!nodes.length) { stopWaitCountdown(holder); return; }
+  if (holder.waitTimer) return;
+  holder.waitTimer = setInterval(() => {
+    const list = root.querySelectorAll('[data-wait-until]');
+    if (!list.length) { stopWaitCountdown(holder); return; }
+    list.forEach(n => {
+      const sec = Math.ceil((Number(n.dataset.waitUntil) - Date.now()) / 1000);
+      n.textContent = sec > 0 ? sec + (n.dataset.waitSuffix || 's 后重试') : '重试提交中…';
+    });
+  }, 1000);
+}
+function stopWaitCountdown(holder) {
+  if (holder && holder.waitTimer) { clearInterval(holder.waitTimer); holder.waitTimer = null; }
+}
+
 /* 头像 */
 function avatar(name) {
   return esc((name || 'U').trim().slice(0, 1).toUpperCase());
 }
 
-/* 面包屑:项目分集 → 分集列表 → 视频创作
-   items: [{ label, href?, title?, tag? }],最后一项为当前页(不可点) */
-function breadcrumb(items, opts = {}) {
-  let html = '';
-  items.forEach((it, i) => {
-    if (i) html += '<i class="crumb-sep">/</i>';
-    if (it.href && i < items.length - 1) {
-      html += `<a href="${it.href}" title="${esc(it.title || it.label)}">${esc(it.label)}</a>`;
-    } else {
-      html += `<span class="crumb-cur">${it.tag ? `<span class="crumb-tag">${esc(it.tag)}</span>` : ''}${esc(it.label)}</span>`;
-    }
-  });
-  return `<nav class="crumb${opts.cls ? ' ' + opts.cls : ''}">${html}</nav>`;
-}
-
 /* 上传拖放区域 */
-function makeDropzone({ text = '拖拽文件到此处,或点击选择', multiple = true, accept = '', onFiles }) {
+function makeDropzone({ text = '拖拽文件到此处，或点击选择', multiple = true, accept = '', onFiles }) {
   const dz = el(`<div class="dropzone"><div class="dz-ico">${icon('upload')}</div><div>${esc(text)}</div></div>`);
   const input = el(`<input type="file" style="display:none" ${multiple ? 'multiple' : ''} accept="${esc(accept)}">`);
   dz.appendChild(input);
@@ -173,35 +178,26 @@ function makeDropzone({ text = '拖拽文件到此处,或点击选择', multiple
   return dz;
 }
 
-/* 音频波形(基于 Web Audio 解码) */
-async function drawWaveform(container, url) {
-  try {
-    const res = await fetch(url);
-    const buf = await res.arrayBuffer();
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    const ctx = new Ctx();
-    const audio = await ctx.decodeAudioData(buf);
-    const data = audio.getChannelData(0);
-    const canvas = container;
-    canvas.width = canvas.clientWidth * 2;
-    canvas.height = canvas.clientHeight * 2;
-    const g = canvas.getContext('2d');
-    g.fillStyle = 'rgba(255,207,77,.4)';
-    const step = Math.floor(data.length / 140);
-    for (let i = 0; i < 140; i++) {
-      const s = data[i * step];
-      const h = Math.abs(s) * canvas.height * 0.9;
-      g.fillRect(i * (canvas.width / 140), (canvas.height - h) / 2, canvas.width / 140 - 2, h);
-    }
-    ctx.close();
-  } catch (e) { /* 忽略解码失败 */ }
-}
-
 function download(url, name) {
   const a = document.createElement('a');
   a.href = url; a.download = name || '';
   document.body.appendChild(a); a.click(); a.remove();
 }
+
+/* 下拉菜单：全局单点委托，避免每个视图各自注册 document 监听造成叠加 */
+function closeMenus(except) {
+  document.querySelectorAll('.menu-pop').forEach(p => { if (p !== except) p.classList.add('hidden'); });
+}
+function bindMenu(btn, pop) {
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const wasHidden = pop.classList.contains('hidden');
+    closeMenus();
+    pop.classList.toggle('hidden', !wasHidden);
+  });
+  pop.addEventListener('click', () => pop.classList.add('hidden'));
+}
+document.addEventListener('click', () => closeMenus());
 
 /* 右击快捷菜单
    items: [{ label, icon?, danger?, disabled?, onClick }...] */
@@ -229,7 +225,105 @@ function contextMenu(e, items) {
   }, 0);
 }
 
-/* 返回顶部浮标:长列表页滚动超过 600px 后出现(捕获阶段监听各滚动容器) */
+/* ---------- 列表分页(项目优化 26·1):资源/素材类列表统一每页 20 条 ---------- */
+const PAGE_SIZE = 20;
+
+/* 把分页控件画进 box:共 N 条 · 第 x/y 页 · 上一页/页码/下一页
+   只有一页时清空控件(不留常驻占位)。o = { page, pageSize, total, onPage } */
+function renderPager(box, o) {
+  if (!box) return;
+  const pageSize = Math.max(1, Number(o.pageSize) || PAGE_SIZE);
+  const total = Math.max(0, Number(o.total) || 0);
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  const page = Math.min(Math.max(1, Number(o.page) || 1), pages);
+  box.classList.add('pager');
+  box.innerHTML = '';
+  if (pages <= 1) return;
+  const btn = (label, opts) => {
+    const b = el(`<button class="pg-btn${opts && opts.on ? ' on' : ''}"${opts && opts.disabled ? ' disabled' : ''}>${label}</button>`);
+    if (opts && opts.onClick && !opts.disabled) b.addEventListener('click', opts.onClick);
+    return b;
+  };
+  box.appendChild(el(`<span class="pager-info">共 <b class="gold-num">${total}</b> 条 · 每页 ${pageSize} 条</span>`));
+  box.appendChild(btn(icon('chevron-left', 'ico-xs') + '上一页', { disabled: page <= 1, onClick: () => o.onPage(page - 1) }));
+  /* 页码窗口:首、尾、当前页 ±1,中间用省略号 */
+  const nums = [...new Set([1, pages, page - 1, page, page + 1])].filter(n => n >= 1 && n <= pages).sort((a, b) => a - b);
+  let prev = 0;
+  for (const n of nums) {
+    if (prev && n - prev > 1) box.appendChild(el('<span class="pg-gap">…</span>'));
+    box.appendChild(btn(String(n), { on: n === page, onClick: () => n !== page && o.onPage(n) }));
+    prev = n;
+  }
+  box.appendChild(btn('下一页' + icon('chevron-right', 'ico-xs'), { disabled: page >= pages, onClick: () => o.onPage(page + 1) }));
+}
+
+/* ---------- 生图输出规格(项目优化 26·3):分辨率档 + 画幅比例 → 尺寸预览 ----------
+   与服务端 server/api/images.js 的 resolutionToPx / deriveSize 同一口径 */
+const IMG_RES_TIERS = ['1K', '2K', '4K'];
+const IMG_RES_LABELS = { '1K': '1K · 1024 短边，日常出图', '2K': '2K · 2048 短边，高清', '4K': '4K · 4096 短边，超清' };
+const RES_SHORT_EDGE = { '1K': 1024, '2K': 2048, '4K': 4096 };
+
+function resTierToPx(v) {  const s = String(v == null ? '' : v).trim().toLowerCase();
+  if (!s) return 0;
+  const m = /^([0-9]+(?:\.[0-9]+)?)\s*k/.exec(s);
+  if (m) return Math.round(parseFloat(m[1]) * 1024);
+  const px = Math.round(Number(s));
+  return Number.isFinite(px) && px > 0 ? px : 0;
+}
+
+/* 档位 → 下拉里的可读文案:1K/2K/4K 用行业叫法,历史数字档退回「Npx 短边」 */
+function resTierLabel(v) {
+  const s = String(v == null ? '' : v).trim();
+  const up = s.toUpperCase();
+  if (IMG_RES_LABELS[up]) return IMG_RES_LABELS[up];
+  const px = resTierToPx(s);
+  return px ? px + 'px 短边 · ' + (px >= 2048 ? '高清' : px >= 1024 ? '标准' : '草稿') : s;
+}
+
+/* 比例 × 分辨率档 → { w, h }(偶数,长边不超过 4096);比例解析失败按 1:1 */
+function imgSizeFrom(ratio, res) {
+  let short = resTierToPx(res) || 1024;
+  short = Math.max(64, Math.min(4096, short));
+  const m = /^([0-9.]+)\s*[:x/／]\s*([0-9.]+)$/.exec(String(ratio || '').trim());
+  let rw = 1, rh = 1;
+  if (m) { const a = parseFloat(m[1]), b = parseFloat(m[2]); if (a > 0 && b > 0) { rw = a; rh = b; } }
+  let w = rw >= rh ? short * rw / rh : short;
+  let h = rw >= rh ? short : short * rh / rw;
+  const over = Math.max(w, h) / 4096;
+  if (over > 1) { w /= over; h /= over; }
+  const even = v => Math.max(16, Math.round(v / 2) * 2);
+  return { w: even(w), h: even(h) };
+}
+
+/* ---------- 视频出片规格(项目优化 26·5):分辨率档 × 画幅 → 成片宽高 ----------
+   与 server/ffmpeg.js 的 videoWH 同一口径 */
+const VIDEO_RES_EDGES = { '480p': 480, '720p': 720, '960p': 960, '1080p': 1080, '2k': 1440, '4k': 2160 };
+const VIDEO_RATIOS = [
+  { v: '16:9', t: '16:9 · 横屏' }, { v: '9:16', t: '9:16 · 竖屏' },
+  { v: '4:3', t: '4:3 · 横屏' }, { v: '3:4', t: '3:4 · 竖屏' },
+  { v: '1:1', t: '1:1 · 方屏' }, { v: '21:9', t: '21:9 · 影院宽幅' }
+];
+/* 分辨率档 → 下拉文案:附带按 16:9 换算出的成片尺寸,选了才知道出多大 */
+const VIDEO_RES_NOTES = { '480p': '标清 · 草稿预览', '720p': '高清 · 通用推荐', '960p': '准高清 · 清晰与速度兼顾', '1080p': '全高清', '2k': '2K · 成品出片', '4k': '4K · 成品出片' };
+function videoResLabel(v) {
+  const key = String(v || '').trim().toLowerCase();
+  const wh = videoWH(key, '16:9');
+  const note = VIDEO_RES_NOTES[key] || '';
+  return String(v || '').toUpperCase() + ' · ' + wh.w + '×' + wh.h + (note ? '(' + note + ')' : '');
+}
+
+function videoWH(resolution, aspectRatio) {
+  let short = VIDEO_RES_EDGES[String(resolution || '').trim().toLowerCase()] || 720;
+  const m = /^([0-9.]+)\s*[:x/／]\s*([0-9.]+)$/.exec(String(aspectRatio || '').trim());
+  let rw = 16, rh = 9;
+  if (m) { const a = parseFloat(m[1]), b = parseFloat(m[2]); if (a > 0 && b > 0) { rw = a; rh = b; } }
+  const even = v => Math.max(2, Math.round(v / 2) * 2);
+  const long = Math.max(rw, rh), side = Math.min(rw, rh);
+  if (short * long / side > 4096) short = Math.floor(4096 * side / long);
+  return rw >= rh ? { w: even(short * rw / rh), h: even(short) } : { w: even(short), h: even(short * rh / rw) };
+}
+
+/* 返回顶部浮标：长列表页滚动超过 600px 后出现(捕获阶段监听各滚动容器) */
 (function () {
   function init() {
     if (document.getElementById('toTopBtn')) return;

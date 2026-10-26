@@ -16,7 +16,8 @@
  */
 const agnes = require('./agnes');
 const { db } = require('./db');
-const { generateI2V } = require('./ffmpeg');
+const { generateI2V, videoWH } = require('./ffmpeg');
+const { BUSY_STATUS, busyError, retryAfterMs } = require('./util');
 
 const CREATE_TIMEOUT_MS = 120e3;
 const CREATE_ATTEMPTS = 3;
@@ -154,13 +155,20 @@ function promptForReference(promptText, nameToIndex) {
   });
 }
 
-/* reference 模式的媒体清单:源图占 Picture 1,参考图随后,上限受模型规则限制 */
+/* reference 模式的媒体清单:源图占 Picture 1,参考图随后,上限受模型规则限制。
+   按资产 ID 去重 —— 源图与 [占位符] 链接常是同一资产,不去重会把同一张图传两遍 */
 function planMedia(ctx, mode, rules) {
   const linked = (ctx.linked || []).filter(a => a && a.type !== 'audio');
   const maxImages = Math.max(1, Number((rules.limits && rules.limits.max_images) || 5));
   const images = [];
-  if (ctx.src) images.push(ctx.src);
-  for (const a of linked) { if (images.length >= maxImages) break; images.push(a); }
+  const seenIds = new Set();
+  const pushImg = a => {
+    if (!a || seenIds.has(a.id) || images.length >= maxImages) return;
+    seenIds.add(a.id);
+    images.push(a);
+  };
+  if (ctx.src) pushImg(ctx.src);
+  for (const a of linked) pushImg(a);
   const audios = (ctx.linked || []).filter(a => a && a.type === 'audio').slice(0, 5);
   const nameToIndex = new Map();
   images.forEach((a, i) => {
@@ -224,7 +232,10 @@ async function generateAgnes(ctx, family) {
     firstFrame: mode === 'keyframe' ? toMedia(firstFrame) : undefined,
     negativePrompt: task.negative_prompt || '',
     seed: params.seed,
-    fps: params.fps
+    fps: params.fps,
+    /* 模型规则里的限制清单透传给客户端:固定输出档 / 秒数区间 / 参考图上限
+       都由后台 rules 决定,新增模型不改代码(需求 26·9) */
+    limits: rules.limits || {}
   });
   if (ctx.recordRemote) ctx.recordRemote(videoId);
 
@@ -287,6 +298,8 @@ function ctxMapFor(model, task, params, prompt, mode, media) {
     mode,
     seconds: params.duration || 5,
     size,
+    /* 像素串(如 1280x720):LTX / Kling 等网关的 resolution 字段要的是像素而不是档位 */
+    size_px: (() => { const wh = videoWH(params.resolution || '720p', params.aspect_ratio || '16:9'); return wh.w + 'x' + wh.h; })(),
     aspect_ratio: params.aspect_ratio || '16:9',
     seed: params.seed != null && params.seed !== '' ? params.seed : -1,
     fps: params.fps != null ? params.fps : 24,
@@ -299,11 +312,47 @@ function ctxMapFor(model, task, params, prompt, mode, media) {
   return m;
 }
 
+/* 深填充:令牌可出现在模板任意深度(数组/嵌套对象),供 media 结构非扁平的网关使用
+   (如百炼 wan3.0 的 input.media:[{type,url}])。值为 <__DROP__> 的键直接省略。 */
+function deepFill(value, ctxMap) {
+  if (typeof value === 'string') return fillTemplate(value, ctxMap);
+  if (Array.isArray(value)) {
+    const arr = [];
+    for (const v of value) { const r = deepFill(v, ctxMap); if (r !== '<__DROP__>') arr.push(r); }
+    return arr;
+  }
+  if (value && typeof value === 'object') {
+    const o = {};
+    for (const [k, v] of Object.entries(value)) {
+      const r = deepFill(v, ctxMap);
+      if (r !== '<__DROP__>') o[k] = r;
+    }
+    return o;
+  }
+  return value;
+}
+
 /* 依据 rules.create.body 模板 + mode 媒体字段构造请求体 */
 async function buildOpenAiBody(rules, model, task, params, prompt, mode, media) {
   const create = rules.create || {};
   const body = dropSentinel(deepCopy(create.body || {}));
   const cmap = ctxMapFor(model, task, params, prompt, mode, media);
+
+  /* 媒体令牌先解析成真实地址(公网直链或 data URI),这样模板里写 <first_frame> 也能用 */
+  if (media.firstFrame) cmap.first_frame = await agnes.mediaRefAsync(toMedia(media.firstFrame));
+  if (media.lastFrame) cmap.last_frame = await agnes.mediaRefAsync(toMedia(media.lastFrame));
+  if (media.images && media.images.length) {
+    const refs = [];
+    for (const im of media.images) refs.push(await agnes.mediaRefAsync(toMedia(im)));
+    cmap.images = refs;
+  }
+  if (media.audios && media.audios.length) {
+    const refs = [];
+    for (const a of media.audios) refs.push(await agnes.mediaRefAsync(toMedia(a)));
+    cmap.audios = refs;
+  }
+  /* 模板已自带媒体结构时(嵌套写法),整体走深填充,不再做顶层替换 */
+  if (create.body && create.nested_media) return deepFill(create.body, cmap);
 
   /* 1) 标量占位符替换;2) 媒体注入 */
   const out = {};
@@ -374,6 +423,12 @@ async function openAiCreate(rules, model, body) {
       (create.path || '/videos'), ...CANDIDATE_CREATE_PATHS].map(p => String(p).replace(/^\/?/, '/')))];
   let lastErr = '';
   const tried = [];
+  /* 自定义请求头:有些网关靠头传模型名/异步开关(如百炼 X-DashScope-Async、Vercel ai-model-id) */
+  const extraHeaders = {};
+  for (const [k, v] of Object.entries(create.headers || {})) {
+    if (v == null || v === '') continue;
+    extraHeaders[String(k)] = String(v).split('<model_id>').join(model.model_id || '').split('<api_key>').join(model.api_key || '');
+  }
   for (const pathPart of candidates) {
     const url = base + pathPart;
     for (let attempt = 1; attempt <= CREATE_ATTEMPTS; attempt++) {
@@ -381,7 +436,7 @@ async function openAiCreate(rules, model, body) {
       try {
         res = await fetch(url, {
           method: create.method || 'POST',
-          headers: { Authorization: 'Bearer ' + model.api_key, 'Content-Type': 'application/json' },
+          headers: Object.assign({ Authorization: 'Bearer ' + model.api_key, 'Content-Type': 'application/json' }, extraHeaders),
           body: JSON.stringify(body),
           signal: AbortSignal.timeout(CREATE_TIMEOUT_MS)
         });
@@ -390,12 +445,20 @@ async function openAiCreate(rules, model, body) {
         if (attempt < CREATE_ATTEMPTS) { lastErr = url + ' → ' + reason; await sleep(1200 * attempt); continue; }
         throw new Error('无法连接视频 API(' + reason + '),已自动重试 ' + (attempt - 1) + ' 次仍失败');
       }
-      const text = await res.text();
+      let text = '';
+      try { text = await res.text(); }
+      catch (e) { throw new Error('创建任务响应读取中断(' + (e.message || e.name) + ');网关可能已建单并扣费,请到服务商核对账单后再重试'); }
       let data = null;
       try { data = text ? JSON.parse(text) : null; } catch (e) {}
       if (res.ok) {
-        const videoId = data && (data.video_id || data.id || data.task_id);
-        if (!videoId) throw new Error('创建任务响应缺少 video_id: ' + text.slice(0, 200));
+        /* 任务 ID 嵌套时(如百炼 output.task_id)按 create.id_path 取;否则找顶层常见字段 */
+        let videoId;
+        if (create.id_path) {
+          videoId = String(create.id_path).split('.').reduce((o, k) => (o && typeof o === 'object' ? o[k] : undefined), data);
+        } else {
+          videoId = data && (data.video_id || data.id || data.task_id);
+        }
+        if (!videoId) throw new Error('创建任务响应缺少 video_id' + (create.id_path ? '(按 ' + create.id_path + ' 取不到)' : '') + ': ' + text.slice(0, 200));
         createPathMemo.set(model.id, pathPart); /* 记住试通的创建路径 */
         return { videoId, raw: data, path: pathPart };
       }
@@ -408,6 +471,8 @@ async function openAiCreate(rules, model, body) {
         throw new Error('创建任务失败(HTTP ' + res.status + '): ' + detail +
           ' —— 服务商未开放该模型的视频 API,请到服务商控制台确认视频生成通道或联系服务商开通;本站接口与 Key 均正常');
       }
+      /* 网关排队已满/限流:抛 retryable 交给 worker 延迟重投,原地退避只会占用任务槽 */
+      if (BUSY_STATUS.includes(res.status)) throw busyError(res.status, detail, retryAfterMs(res));
       const routeMissing = isRouteMissing404(res, data);
       const isLast = pathPart === candidates[candidates.length - 1];
       /* 路由不存在 → 换下一个候选;业务应答或已是最后一个候选 → 汇总报错 */
@@ -455,7 +520,9 @@ function openAiNormalize(data, rules) {
   else if (failed.includes(raw)) status = 'failed';
   else if (raw === 'queued' || raw === 'pending') status = 'queued';
   const progress = Number(payload[q.progress_field || 'progress'] ?? NaN);
-  const error = String(payload[q.error_field || 'error'] || payload.failure_reason || '').slice(0, 300);
+  /* error 字段可能是对象(如智谱 {error:{code,message}}),直接 String() 会得到 [object Object] */
+  const rawErr = payload[q.error_field || 'error'] || payload.failure_reason || '';
+  const error = (typeof rawErr === 'string' ? rawErr : detailText(rawErr)).slice(0, 300);
   const videoUrl = pickVideoUrl(payload, q.video_url_field);
   return {
     status, raw,
@@ -470,6 +537,8 @@ function pickVideoUrl(obj, videoUrlField) {
   if (videoUrlField && typeof obj[videoUrlField] === 'string') return obj[videoUrlField];
   const cands = [obj.url, obj.video_url, obj.videoUrl, obj.download_url, obj.result_url,
     obj.metadata && obj.metadata.url,
+    /* 结果嵌一层 result 的网关(如 LTX:{"status":"completed","result":{"video_url":…}}) */
+    obj.result && (typeof obj.result === 'string' ? obj.result : (obj.result.video_url || obj.result.url)),
     obj.output && (typeof obj.output === 'string' ? obj.output : obj.output.url),
     Array.isArray(obj.videos) && obj.videos[0] && (obj.videos[0].url || obj.videos[0]),
     Array.isArray(obj.outputs) && obj.outputs[0]];
@@ -485,7 +554,9 @@ async function openAiQuery(rules, model, videoId) {
      创建路径/{id} → /videos/{id} → 旧版 /agnesapi(use_origin) */
   if (userQuery) {
     let url;
-    const pathPart = String(q.path || '/agnesapi').replace(/^\/?/, '/');
+    /* 路径里也能带任务 ID(如百炼 GET /api/v1/tasks/<video_id>) */
+    const pathPart = String(q.path || '/agnesapi').replace(/^\/?/, '/')
+      .split('<video_id>').join(encodeURIComponent(videoId)).split('<model_id>').join(encodeURIComponent(model.model_id || ''));
     if (q.use_origin) {
       try { url = new URL(base).origin + pathPart; }
       catch (e) { url = base.replace(/\/+$/, '').replace(/\/v\d+$/, '') + pathPart; }
@@ -567,8 +638,12 @@ async function generateOpenAi(ctx) {
 /* ---------- 适配器:本地 ffmpeg 渲染 ---------- */
 async function generateFfmpeg(ctx) {
   const { task, params, src, outFile } = ctx;
+  const wh = videoWH(params.resolution, params.aspect_ratio);
   const lp = JSON.parse(task.params || '{}');
   lp.engine = 'ffmpeg-local';
+  /* 记录实际出片尺寸,任务/生成记录直接可见「设的分辨率比例出了多大」 */
+  lp.out_width = wh.w;
+  lp.out_height = wh.h;
   db.prepare('UPDATE tasks SET params=? WHERE id=?').run(JSON.stringify(lp), task.id);
   await generateI2V({
     input: src.path,
@@ -578,6 +653,9 @@ async function generateFfmpeg(ctx) {
     motion: params.motion ?? 0.5,
     seed: params.seed,
     grade: ctx.styleGrade,
+    /* 第三十三轮:分辨率档与画幅比例真正落到出片尺寸(此前固定 1280×720) */
+    resolution: params.resolution,
+    aspect_ratio: params.aspect_ratio,
     onProgress: sec => {
       const total = (params.duration || 5) + 1;
       const p = Math.min(96, Math.round(8 + (sec / total) * 88));

@@ -16,6 +16,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { db } = require('./db');
 const { run } = require('./ffmpeg');
+const { BUSY_STATUS, busyError, retryAfterMs } = require('./util');
 
 const FLASH_MODEL_ID = 'agnes-video-2.5-flash';
 const POLL_INTERVAL_MS = 1500;      // 文档建议 1~2 秒查询一次
@@ -189,17 +190,25 @@ async function v2Body(o) {
   return body;
 }
 
-/* 2.5 / Flash 家族:mode text|keyframe|reference + seconds + size=720P + images[] */
+/* 2.5 / Flash 家族:mode text|keyframe|reference + seconds + size + images[]
+   限制项(固定输出档 / 秒数区间 / 参考图上限)全部读自模型规则 rules.limits,
+   后台改规则即可适配新一代接口,不必改这里 */
 async function flashBody(o) {
+  const lim = o.limits || {};
+  const minSec = Number(lim.min_seconds) || 4;
+  const maxSec = Number(lim.max_seconds) || 12;
   const body = {
     model: o.model || FLASH_MODEL_ID,
     prompt: String(o.prompt || ''),
     mode: o.mode,                       // text | keyframe | reference
-    seconds: String(Math.min(12, Math.max(4, Number(o.seconds) || 5))),
+    seconds: String(Math.min(maxSec, Math.max(minSec, Number(o.seconds) || 5))),
     n: 1
   };
-  /* Flash:size 只接受 "720P" */
-  if ((o.model || '').includes('flash')) body.size = '720P';
+  /* 输出档:规则声明了 fixed_size(Flash 仅 "720P")就以它为准;
+     未声明时按模型 ID 特征回退,再否则用用户所选分辨率 */
+  const fixed = String(lim.fixed_size || '').trim();
+  if (fixed) body.size = fixed;
+  else if ((o.model || '').includes('flash')) body.size = '720P';
   else if (o.size) body.size = o.size;
   if (o.aspectRatio) body.aspect_ratio = o.aspectRatio;
 
@@ -209,7 +218,7 @@ async function flashBody(o) {
     if (o.firstFrame) body.first_frame = await mediaRefAsync(o.firstFrame);
     if (o.lastFrame) body.last_frame = await mediaRefAsync(o.lastFrame);
   } else if (o.mode === 'reference') {
-    const imgs = (o.images || []).slice(0, 5); // Flash 最多 5 张
+    const imgs = (o.images || []).slice(0, Math.max(1, Number(lim.max_images) || 5));
     if (!imgs.length) throw new Error('reference 模式需要至少一张参考图');
     body.images = [];
     for (const im of imgs) body.images.push(await mediaRefAsync(im));
@@ -217,7 +226,7 @@ async function flashBody(o) {
       body.audios = [];
       for (const a of o.audios) body.audios.push(await mediaRefAsync(a));
     }
-    /* Flash 不支持 videos:刻意不传该字段 */
+    /* 网关不支持 videos 时(Flash):刻意不传该字段 */
   }
   return body;
 }
@@ -254,13 +263,18 @@ async function createVideoTask(o) {
       if (attempt < CREATE_ATTEMPTS) { lastReason = reason; await sleep(1200 * attempt); continue; }
       throw new Error('无法连接视频 API(' + reason + '),已自动重试 ' + (attempt - 1) + ' 次仍失败');
     }
-    const text = await res.text();
+    let text = '';
+    try { text = await res.text(); }
+    catch (e) { throw new Error('创建任务响应读取中断(' + (e.message || e.name) + ');网关可能已建单并扣费,请到服务商核对账单后再重试'); }
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch (e) { /* 保留原文 */ }
     if (!res.ok) {
       const rawDetail = data && data.detail != null ? data.detail : (data && data.error != null
         ? (typeof data.error === 'object' ? (data.error.message ?? data.error) : data.error) : null);
       const detail = detailText(rawDetail) || text.slice(0, 200);
+      /* 网关排队已满(如 "video queue is full, please retry later"):
+         拥堵通常持续数分钟,原地退避只会占用任务槽 —— 抛 retryable 交给 worker 延迟重投 */
+      if (BUSY_STATUS.includes(res.status)) throw busyError(res.status, detail, retryAfterMs(res));
       throw new Error('创建任务失败(HTTP ' + res.status + '): ' + detail);
     }
     const videoId = data && (data.video_id || data.id || data.task_id);

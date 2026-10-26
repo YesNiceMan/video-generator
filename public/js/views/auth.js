@@ -39,8 +39,8 @@ const AuthView = {
       <div class="field"><label>密码</label><input class="input" id="afPass" type="password" placeholder="至少 6 位"></div>
       <button class="btn btn-primary btn-block" id="afSubmit">${iconText('log-in', isLogin ? '登 录' : '注 册')}</button>`;
     this.switchEl.innerHTML = isLogin
-      ? `还没有账号?<a href="#" id="afGo">立即注册</a>`
-      : `已有账号?<a href="#" id="afGo">去登录</a>`;
+      ? `还没有账号？<a href="#" id="afGo">立即注册</a>`
+      : `已有账号？<a href="#" id="afGo">去登录</a>`;
     this.formEl.querySelector('#afSubmit').addEventListener('click', () => this.submit());
     this.formEl.querySelectorAll('input').forEach(i => i.addEventListener('keydown', e => { if (e.key === 'Enter') this.submit(); }));
     this.switchEl.querySelector('#afGo').addEventListener('click', e => { e.preventDefault(); this.mode = isLogin ? 'register' : 'login'; this.renderForm(); });
@@ -59,8 +59,8 @@ const AuthView = {
       } else {
         await API.post('/auth/register', { email, password: pass, name });
       }
-      toast(this.mode === 'login' ? '登录成功,正在进入…' : '注册成功,正在进入…', 'ok');
-      /* 确保离开登录/注册页再引导,避免 route 命中 login 分支又渲染回登录页 */
+      toast(this.mode === 'login' ? '登录成功，正在进入…' : '注册成功，正在进入…', 'ok');
+      /* 确保离开登录/注册页再引导，避免 route 命中 login 分支又渲染回登录页 */
       if (location.hash === '#/login' || location.hash === '#/register') {
         history.replaceState(null, '', location.pathname + location.search);
       }

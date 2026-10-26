@@ -33,6 +33,7 @@ app.use('/api/auth', require('./api/auth'));
 app.use('/api/assets', require('./api/assets'));
 app.use('/api/styles', require('./api/styles'));
 app.use('/api/tasks', require('./api/tasks'));
+app.use('/api/images', require('./api/images')); // 第二十五轮:AI 生图
 app.use('/api/credits', require('./api/credits'));
 app.use('/api', require('./api/projects'));
 app.use('/api/admin', require('./api/admin'));

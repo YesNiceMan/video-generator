@@ -35,9 +35,25 @@ function normalizeRulesInput(raw) {
   let v = raw;
   if (typeof v === 'string') { try { v = JSON.parse(v); } catch (e) { throw httpError(400, '生成规则不是合法的 JSON:' + e.message); } }
   if (!v || typeof v !== 'object' || Array.isArray(v)) throw httpError(400, '生成规则必须是 JSON 对象');
-  const known = ['agnes-flash', 'agnes-v2', 'openai-video', 'ffmpeg'];
+  /* 第二十五轮:并入生图协议(openai-image / gemini-image / img-ffmpeg) */
+  const known = ['agnes-flash', 'agnes-v2', 'openai-video', 'ffmpeg', 'openai-image', 'gemini-image', 'img-ffmpeg'];
   if (v.protocol && !known.includes(v.protocol)) throw httpError(400, '未知的生成协议: ' + v.protocol + '(可选:' + known.join('/') + ')');
   return JSON.stringify(v);
+}
+
+/* 第二十六轮:生图模型能力勾选(t2i / i2i / 多图合成)→ rules.caps 规范化。
+ * caps 为空数组时从 rules 中剔除(视为「仅文生图」默认能力) */
+const IMAGE_CAPS = ['text-to-image', 'image-to-image', 'multi-image'];
+function mergeImageCaps(rulesRaw, capsRaw) {
+  let rules = {};
+  const normalized = normalizeRulesInput(rulesRaw);
+  if (normalized) { try { rules = JSON.parse(normalized); } catch (e) { rules = {}; } }
+  if (capsRaw === undefined) return rules;
+  const arr = Array.isArray(capsRaw) ? capsRaw.map(x => String(x || '').trim()).filter(Boolean) : [];
+  const caps = IMAGE_CAPS.filter(c => arr.includes(c));
+  if (caps.length) rules.caps = caps;
+  else delete rules.caps;
+  return rules;
 }
 
 /* 规范化 API 地址(去掉尾斜杠),Key 与模型 ID 截断 */
@@ -134,14 +150,24 @@ r.patch('/users/:id', asyncRoute(async (req, res) => {
 r.get('/tasks', asyncRoute(async (req, res) => {
   const { status, q } = req.query;
   const params = [];
-  let sql = `SELECT t.*, u.email AS user_email, u.name AS user_name, m.name AS model_name FROM tasks t JOIN users u ON u.id=t.user_id LEFT JOIN models m ON m.id=t.model_id`;
+  const from = 'FROM tasks t JOIN users u ON u.id=t.user_id LEFT JOIN models m ON m.id=t.model_id';
   const where = [];
   if (status && status !== 'all') { where.push('t.status=?'); params.push(status); }
-  if (q) { where.push('(t.id LIKE ? OR u.email LIKE ?)'); params.push('%' + q + '%', '%' + q + '%'); }
-  if (where.length) sql += ' WHERE ' + where.join(' AND ');
-  sql += ' ORDER BY t.created_at DESC LIMIT 200';
-  const rows = db.prepare(sql).all(...params).map(t => ({ ...t, params: JSON.parse(t.params || '{}') }));
-  res.json({ items: rows, running: running.size });
+  if (q) {
+    where.push('(t.id LIKE ? OR u.email LIKE ? OR u.name LIKE ? OR m.name LIKE ? OR t.prompt LIKE ?)');
+    const like = '%' + q + '%';
+    params.push(like, like, like, like, like);
+  }
+  const cond = where.length ? ' WHERE ' + where.join(' AND ') : '';
+  /* 清单只取最近 200 条，但统计必须按全量算：
+     此前卡片显示的是「最近 200 条里已完成多少个」，任务一多就永远卡在 200，等于没信息 */
+  const rows = db.prepare(`SELECT t.*, u.email AS user_email, u.name AS user_name, m.name AS model_name ${from}${cond} ORDER BY t.created_at DESC LIMIT 200`)
+    .all(...params).map(t => ({ ...t, params: JSON.parse(t.params || '{}') }));
+  const counts = {};
+  db.prepare(`SELECT t.status AS s, COUNT(*) AS c ${from}${cond} GROUP BY t.status`)
+    .all(...params).forEach(g => { counts[g.s] = g.c; });
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  res.json({ items: rows, running: running.size, counts, total });
 }));
 
 r.post('/tasks/:id/cancel', asyncRoute(async (req, res) => {
@@ -189,22 +215,41 @@ r.post('/models', asyncRoute(async (req, res) => {
   const name = String(b.name || '').trim().slice(0, 80);
   if (!name) throw httpError(400, '模型名称不能为空');
   const api = normalizeApiConfig(b);
-  const rules = normalizeRulesInput(b.rules);
+  /* 第二十五轮:生图模型默认参数模板(尺寸/种子)与视频模型不同 */
+  const isImageModel = b.type === 'text-to-image';
+  /* 第二十六轮:生图模型能力勾选(text-to-image / image-to-image / multi-image)
+     mergeImageCaps 会把 caps 并入 rules,并把 limits.max_count 写入规则 */
+  let rules = isImageModel
+    ? JSON.stringify(mergeImageCaps(b.rules, b.caps))
+    : normalizeRulesInput(b.rules);
+  if (isImageModel) {
+    /* 张数上限也允许从 rules JSON 覆盖,这里只在 body 显式给 max_count 时写入 */
+    const maxCount = Number(b.max_count);
+    if (Number.isFinite(maxCount) && maxCount >= 1) {
+      const robj = JSON.parse(rules || '{}');
+      robj.limits = Object.assign({}, robj.limits, { max_count: Math.min(4, Math.round(maxCount)) });
+      rules = JSON.stringify(robj);
+    }
+  }
   const id = uid('m-');
   /* 模型每秒积分消耗(0/留空 = 跟随系统设置里的全局定价) */
   const creditPerSecond = Math.max(0, Number(b.credit_per_second) || 0);
   /* 第二十三轮:新建模型未提供参数模板时补默认标准参数,
      避免空 schema 导致任务参数(时长/帧率等)读不到、积分按默认 5s 误计 */
   const schemaProvided = Array.isArray(b.params_schema) && b.params_schema.length > 0;
-  const effSchema = schemaProvided ? b.params_schema : [
+  const effSchema = schemaProvided ? b.params_schema : (isImageModel ? [
+    { key: 'size', label: '尺寸', type: 'select', options: ['1024x1024', '1536x1024', '1024x1536', 'auto'], default: '1024x1024' },
+    { key: 'seed', label: '随机种子(-1 随机)', type: 'number', default: -1 }
+  ] : [
     { key: 'duration', label: '时长(秒)', type: 'range', min: 1, max: 20, step: 1, default: 5 },
     { key: 'fps', label: '帧率', type: 'select', options: [23.976, 24, 25, 29.97, 30, 48, 50, 60], default: 24 },
     { key: 'motion', label: '运动强度', type: 'range', min: 0, max: 1, step: 0.05, default: 0.5 },
     { key: 'seed', label: '随机种子(-1 随机)', type: 'number', default: -1 }
-  ];
+  ]);
+  const typeVal = isImageModel ? 'text-to-image' : (b.type === 'text-to-video' ? 'text-to-video' : 'image-to-video');
   db.prepare(`INSERT INTO models(id,name,type,version,description,endpoint,params_schema,enabled,concurrency,api_base,api_key,model_id,rules,credit_per_second,created_at)
     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(id, name, b.type === 'text-to-video' ? 'text-to-video' : 'image-to-video',
+    .run(id, name, typeVal,
       String(b.version || 'v1').slice(0, 20), String(b.description || '').slice(0, 500), String(b.endpoint || '').slice(0, 200),
       JSON.stringify(effSchema), b.enabled === false ? 0 : 1, clamp(Number(b.concurrency) || 1, 1, 64, 1),
       api.api_base || '', api.api_key || '', api.model_id || '', rules || '', creditPerSecond, now());
@@ -220,7 +265,7 @@ r.patch('/models/:id', asyncRoute(async (req, res) => {
   if (b.version !== undefined) { sets.push('version=?'); params.push(String(b.version).slice(0, 20)); }
   if (b.description !== undefined) { sets.push('description=?'); params.push(String(b.description).slice(0, 500)); }
   if (b.endpoint !== undefined) { sets.push('endpoint=?'); params.push(String(b.endpoint).slice(0, 200)); }
-  if (b.type !== undefined) { sets.push('type=?'); params.push(b.type === 'text-to-video' ? 'text-to-video' : 'image-to-video'); }
+  if (b.type !== undefined) { sets.push('type=?'); params.push(b.type === 'text-to-image' ? 'text-to-image' : (b.type === 'text-to-video' ? 'text-to-video' : 'image-to-video')); }
   if (b.enabled !== undefined) { sets.push('enabled=?'); params.push(b.enabled ? 1 : 0); }
   if (b.concurrency !== undefined) { sets.push('concurrency=?'); params.push(clamp(Number(b.concurrency) || 1, 1, 64, 1)); }
   if (b.params_schema !== undefined) { sets.push('params_schema=?'); params.push(JSON.stringify(b.params_schema || [])); }
@@ -229,8 +274,26 @@ r.patch('/models/:id', asyncRoute(async (req, res) => {
     const cps = Math.max(0, Number(b.credit_per_second) || 0);
     sets.push('credit_per_second=?'); params.push(Math.round(cps * 100) / 100);
   }
-  const rules = normalizeRulesInput(b.rules);
-  if (rules !== undefined) { sets.push('rules=?'); params.push(rules); }
+  /* 第二十六轮:生图模型能力勾选编辑(仅对生图模型生效;与 rules JSON 同步合并) */
+  if (b.caps !== undefined && (m.type === 'text-to-image' || b.type === 'text-to-image')) {
+    const effType = b.type !== undefined ? b.type : m.type;
+    if (effType === 'text-to-image') {
+      const merged = mergeImageCaps(b.rules, b.caps);
+      let rulesStr = JSON.stringify(merged);
+      const maxCount = Number(b.max_count);
+      if (Number.isFinite(maxCount) && maxCount >= 1) {
+        merged.limits = Object.assign({}, merged.limits, { max_count: Math.min(4, Math.round(maxCount)) });
+        rulesStr = JSON.stringify(merged);
+      }
+      sets.push('rules=?'); params.push(rulesStr);
+    } else {
+      const rules = normalizeRulesInput(b.rules);
+      if (rules !== undefined) { sets.push('rules=?'); params.push(rules); }
+    }
+  } else {
+    const rules = normalizeRulesInput(b.rules);
+    if (rules !== undefined) { sets.push('rules=?'); params.push(rules); }
+  }
   Object.assign(b, normalizeApiConfig(b));
   for (const k of ['api_base', 'api_key', 'model_id']) {
     if (b[k] !== undefined) { sets.push(k + '=?'); params.push(String(b[k] || '')); }
@@ -307,16 +370,23 @@ async function runModelCheck(m) {
     if (!Array.isArray(schema)) throw new Error('not array');
     for (const def of schema) {
       if (!def || !def.key || !def.type) throw new Error('缺少 key/type');
-      if (def.type === 'range' && def.max <= def.min) problems.push(`参数 ${def.key}: max 需大于 min`);
+      /* 单一取值的参数是合法声明(如 cogvideox-flash 只支持 5s):允许 max === min,只禁反向区间 */
+      if (def.type === 'range' && Number(def.max) < Number(def.min)) {
+        problems.push(`参数 ${def.key}: max 不能小于 min(只支持单一取值时让 max 等于 min 即可)`);
+      }
     }
   } catch (e) { problems.push('params_schema 不是合法的 JSON 数组'); }
-  if (!['image-to-video', 'text-to-video'].includes(m.type)) problems.push(`未知模型类型: ${m.type}`);
-  /* 检验生成规则(rules) */
+  /* 第二十五轮:text-to-image(AI 生图)并入合法模型类型 */
+  if (!['image-to-video', 'text-to-video', 'text-to-image'].includes(m.type)) problems.push(`未知模型类型: ${m.type}`);
+  /* 检验生成规则(rules):视频模型走 adapters,生图模型走 imagegen */
   try {
-    const { normalizeRules } = require('../adapters');
+    const isImage = m.type === 'text-to-image';
+    const { normalizeRules } = require(isImage ? '../imagegen' : '../adapters');
     const nr = normalizeRules(m);
     if (!nr.protocol) problems.push('生成规则未指定协议,将自动识别');
-    const known = ['agnes-flash', 'agnes-v2', 'openai-video', 'ffmpeg'];
+    const known = isImage
+      ? ['openai-image', 'gemini-image', 'img-ffmpeg']
+      : ['agnes-flash', 'agnes-v2', 'openai-video', 'ffmpeg'];
     if (nr.protocol && !known.includes(nr.protocol)) problems.push('生成规则协议未知: ' + nr.protocol);
   } catch (e) { problems.push('生成规则解析失败: ' + (e.message || e)); }
   const ep = String(m.endpoint || '');
@@ -373,6 +443,23 @@ async function runModelCheck(m) {
       problems.push('本地渲染管线不可用(ffmpeg 试渲失败)');
     }
   }
+  /* 第二十五轮:生图模型(img-ffmpeg 本地占位协议)→ 实际试渲一张 PNG 验证可用 */
+  if (m.type === 'text-to-image' && !m.api_base) {
+    try {
+      const imagegen = require('../imagegen');
+      const tmp = path.join(DATA_DIR, 'tmp', 'imgcheck-' + uid('m'));
+      fs.mkdirSync(path.dirname(tmp), { recursive: true });
+      const files = await imagegen.run(m, {
+        task: { prompt: '模型有效性检查' }, params: { size: '512x512' },
+        prompt: '模型有效性检查', negativePrompt: '', count: 1, refAsset: null, outBase: tmp,
+        onProgress: () => {}
+      });
+      for (const f of (files || [])) { try { fs.unlinkSync(f); } catch (e) {} }
+      if (!files || !files.length) problems.push('本地生图引擎未产出图片');
+    } catch (e) {
+      problems.push('本地生图引擎不可用(' + (e.message || e) + ')');
+    }
+  }
   let message = problems.length ? problems.join(';') : '检查通过:配置有效,渲染管线正常';
   if (apiNote) message += ' · ' + apiNote;
   return { ok: problems.length === 0, message: message.slice(0, 480) };
@@ -387,7 +474,28 @@ r.post('/models/:id/check', asyncRoute(async (req, res) => {
   res.json({ ...result, model: modelJSON(db.prepare('SELECT * FROM models WHERE id=?').get(m.id)) });
 }));
 
-/* 免费模型端到端自检:真实提交一条 2s 测试任务走完整队列 */
+/* 自检参数一律取自模型自己的 params_schema 默认值:
+   写死 2s/24fps 会让「只支持 5 秒」(cogvideox-flash)或 2–30s(百炼)的模型直接被网关判非法参数 */
+function selftestParams(m) {
+  let schema = [];
+  try { schema = JSON.parse(m.params_schema || '[]'); } catch (e) { schema = []; }
+  if (!Array.isArray(schema)) schema = [];
+  const p = { motion: 0.3, seed: -1, selftest: true };
+  for (const def of schema) {
+    if (!def || !def.key) continue;
+    if (def.type === 'range' || def.type === 'number') {
+      const v = Number(def.default != null ? def.default : def.min);
+      if (Number.isFinite(v)) p[def.key] = v;
+    } else if (def.type === 'select' && Array.isArray(def.options) && def.options.length) {
+      p[def.key] = def.options.some(o => String(o) === String(def.default)) ? def.default : def.options[0];
+    }
+  }
+  if (p.duration == null) p.duration = 5;
+  if (p.fps == null) p.fps = 24;
+  return p;
+}
+
+/* 免费模型端到端自检:按模型参数默认值真实提交一条测试任务走完整队列 */
 r.post('/models/:id/selftest', asyncRoute(async (req, res) => {
   const m = db.prepare('SELECT * FROM models WHERE id=?').get(req.params.id);
   if (!m) throw httpError(404, '模型不存在');
@@ -396,6 +504,23 @@ r.post('/models/:id/selftest', asyncRoute(async (req, res) => {
   db.prepare('UPDATE models SET check_status=?, check_message=?, checked_at=? WHERE id=?')
     .run(check.ok ? 'ok' : 'fail', check.message.slice(0, 500), now(), m.id);
   if (!check.ok) throw httpError(400, '模型检查未通过:' + check.message);
+
+  /* 第二十五轮:生图模型自检 → 提交 text-to-image 任务(无需源图) */
+  if (m.type === 'text-to-image') {
+    const taskId = uid('t-');
+    db.prepare(`INSERT INTO tasks(id,user_id,type,model_id,source_asset_id,params,prompt,negative_prompt,status,progress,cost,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,0,?)`)
+      .run(taskId, req.user.id, 'text-to-image', m.id, null,
+        JSON.stringify({ size: '1024x1024', count: 1, selftest: true }),
+        '[系统自检] AI 生图连通性测试:一颗金色星辰在午夜海面上升起,电影感光影', '', 'queued', 0, now());
+    enqueue(taskId);
+    pump();
+    return res.json({
+      check,
+      task: db.prepare('SELECT * FROM tasks WHERE id=?').get(taskId),
+      message: `自检任务已提交(${m.name} · 生图),请在任务监控中查看进度`
+    });
+  }
 
   // 用 lavfi 生成一张测试源图入资产库(admin 名下)
   const { FFMPEG, probe } = require('../ffmpeg');
@@ -414,10 +539,11 @@ r.post('/models/:id/selftest', asyncRoute(async (req, res) => {
 
   // 提交真实任务(免费模型不扣积分)
   const taskId = uid('t-');
+  const stParams = selftestParams(m);
   db.prepare(`INSERT INTO tasks(id,user_id,type,model_id,source_asset_id,params,prompt,negative_prompt,status,progress,cost,created_at)
     VALUES(?,?,?,?,?,?,?,?,?,?,0,?)`)
     .run(taskId, req.user.id, 'image-to-video', m.id, imgId,
-      JSON.stringify({ duration: 2, fps: 24, motion: 0.3, seed: -1, selftest: true }),
+      JSON.stringify(stParams),
       '[系统自检] 免费模型连通性测试:镜头缓慢推近,渐变色卡,验证渲染管线', '', 'queued', 0, now());
   enqueue(taskId);
   pump();
@@ -472,7 +598,8 @@ r.get('/settings', asyncRoute(async (req, res) => {
 
 r.patch('/settings', asyncRoute(async (req, res) => {
   const b = req.body || {};
-  const allowed = ['maxConcurrentTasks', 'defaultQuotaGB', 'gpuPool', 'maxUploadMB', 'creditPerSecond', 'freeCredits'];
+  /* 第二十五轮:creditPerImage = AI 生图每张积分定价(免费生图模型恒 0) */
+  const allowed = ['maxConcurrentTasks', 'defaultQuotaGB', 'gpuPool', 'maxUploadMB', 'creditPerSecond', 'freeCredits', 'creditPerImage'];
   for (const k of allowed) {
     if (b[k] !== undefined) setSetting(k, k === 'gpuPool' ? String(b[k]).slice(0, 300) : Number(b[k]));
   }

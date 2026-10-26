@@ -5,7 +5,8 @@ const path = require('path');
 const fs = require('fs');
 const bcrypt = require('bcryptjs');
 
-const DATA_DIR = path.join(__dirname, '..', 'data');
+/* 可用 DATA_DIR 覆盖:回归测试要跑独立的队列副本,避免和常驻服务抢同一张 tasks 表 */
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, '..', 'data');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const DB_PATH = path.join(DATA_DIR, 'app.db');
 
@@ -223,6 +224,12 @@ function migrate() {
   // 增量迁移(第四轮):项目邀请码 / 用户积分 / 任务积分与占位链接 / 模型有效性检测
   const projCols = db.prepare("SELECT name FROM pragma_table_info('projects')").all().map(r => r.name);
   if (!projCols.includes('code')) db.exec('ALTER TABLE projects ADD COLUMN code TEXT');
+  /* 第三十三轮(项目优化 26·5):项目级出片规格 —— 建项目时就设定帧率 / 画幅比例 / 分辨率 / 单镜时长,
+     分镜工作台新增分镜据此初始化,本地渲染管线据此出片(此前工作台恒为 30fps / 16:9 / 1280×720) */
+  if (!projCols.includes('fps')) db.exec("ALTER TABLE projects ADD COLUMN fps REAL NOT NULL DEFAULT 30");
+  if (!projCols.includes('aspect_ratio')) db.exec("ALTER TABLE projects ADD COLUMN aspect_ratio TEXT DEFAULT '16:9'");
+  if (!projCols.includes('resolution')) db.exec("ALTER TABLE projects ADD COLUMN resolution TEXT DEFAULT '720p'");
+  if (!projCols.includes('shot_duration')) db.exec("ALTER TABLE projects ADD COLUMN shot_duration REAL NOT NULL DEFAULT 10");
   if (db.prepare('SELECT COUNT(*) AS c FROM pragma_index_list(\'projects\') WHERE "unique"=1').get().c === 0) {
     db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_code ON projects(code)');
   }
@@ -232,6 +239,10 @@ function migrate() {
   if (!taskCols.includes('cost')) db.exec('ALTER TABLE tasks ADD COLUMN cost INTEGER NOT NULL DEFAULT 0');
   if (!taskCols.includes('refunded')) db.exec('ALTER TABLE tasks ADD COLUMN refunded INTEGER NOT NULL DEFAULT 0');
   if (!taskCols.includes('linked_asset_ids')) db.exec("ALTER TABLE tasks ADD COLUMN linked_asset_ids TEXT DEFAULT '[]'");
+  /* 第二十五轮(AI 生图):一次生图可产出多张图片,首张记 result_asset_id,全部 ID 记此列 */
+  if (!taskCols.includes('result_asset_ids')) db.exec("ALTER TABLE tasks ADD COLUMN result_asset_ids TEXT DEFAULT '[]'");
+  /* 视频网关排队已满(video_queue_full)时任务延后重投的时间点,NULL 表示立即可取 */
+  if (!taskCols.includes('next_at')) db.exec('ALTER TABLE tasks ADD COLUMN next_at INTEGER');
   const modelCols = db.prepare("SELECT name FROM pragma_table_info('models')").all().map(r => r.name);
   if (!modelCols.includes('is_free')) db.exec('ALTER TABLE models ADD COLUMN is_free INTEGER NOT NULL DEFAULT 0');
   if (!modelCols.includes('check_status')) db.exec("ALTER TABLE models ADD COLUMN check_status TEXT NOT NULL DEFAULT 'unknown'");
@@ -381,6 +392,103 @@ function seed() {
         ]), 1, 2, 1, '免费体验模型:不消耗积分,用于连通性与效果测试。', Date.now());
   }
 
+  /* 第二十五轮(AI 生图):本地占位生图免费模型(幂等)
+     img-ffmpeg 协议:ffmpeg 渲染占位图,不调用外部 API、不消耗积分;
+     用于生图链路测试与离线演示。生图 API 模型由管理员在后台「模型管理」添加 */
+  if (!db.prepare('SELECT 1 FROM models WHERE id=?').get('m-img-free')) {
+    db.prepare('INSERT INTO models(id,name,type,version,endpoint,params_schema,enabled,concurrency,is_free,rules,description,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run('m-img-free', '本地占位生图(免费)', 'text-to-image', 'free-1.0', 'local://imggen/placeholder',
+        /* 第三十三轮:比例 + 分辨率双参数;分辨率用 1K/2K/4K 档(提交时服务端按 比例×分辨率 换算尺寸),
+           能力全开(本地引擎都支持) */
+        JSON.stringify([
+          { key: 'ratio', label: '画幅比例', type: 'select', options: ['1:1', '4:3', '3:4', '16:9', '9:16', '3:2', '2:3', '21:9'], default: '1:1' },
+          { key: 'resolution', label: '分辨率', type: 'select', options: ['1K', '2K', '4K'], default: '1K' },
+          { key: 'seed', label: '随机种子(-1 随机)', type: 'number', default: -1 }
+        ]), 1, 2, 1, JSON.stringify({ protocol: 'img-ffmpeg', limits: { max_count: 4 }, caps: ['text-to-image', 'image-to-image', 'multi-image'] }),
+        '本地占位生图引擎:不消耗积分、不调用外部 API,按提示词生成渐变占位图,用于生图链路测试与演示。', Date.now());
+  }
+  /* 第二十六轮:为已存在的 m-img-free 补比例参数与能力声明(幂等迁移) */
+  {
+    const old = db.prepare('SELECT * FROM models WHERE id=?').get('m-img-free');
+    if (old) {
+      let schema = [];
+      try { schema = JSON.parse(old.params_schema || '[]'); } catch (e) { schema = []; }
+      if (!schema.some(d => d && d.key === 'ratio')) {
+        schema.unshift({ key: 'ratio', label: '画幅比例', type: 'select', options: ['1:1', '4:3', '3:4', '16:9', '9:16', '3:2', '2:3', '21:9'], default: '1:1' });
+        db.prepare('UPDATE models SET params_schema=? WHERE id=?').run(JSON.stringify(schema), 'm-img-free');
+      }
+      let rulesObj = {};
+      try { rulesObj = JSON.parse(old.rules || '{}'); } catch (e) { rulesObj = {}; }
+      if (!Array.isArray(rulesObj.caps) || !rulesObj.caps.length) {
+        rulesObj.caps = ['text-to-image', 'image-to-image', 'multi-image'];
+        db.prepare('UPDATE models SET rules=? WHERE id=?').run(JSON.stringify(rulesObj), 'm-img-free');
+      }
+    }
+  }
+
+  /* 第二十八轮:生图模型参数模板统一为「画幅比例 + 分辨率档」(幂等迁移)
+     修复:「画幅比例」与「尺寸」两个下拉都在表达宽高比,重复且互相打架。
+     - 模板里的 size(WxH 固定清单)转为 rules.limits.sizes(提交时就近吸附的支持清单);
+     - 按 size 短边推断默认分辨率档,写入 resolution 参数(短边基准 512~2048) */
+  {
+    const TIERS = ['512', '768', '1024', '1280', '1536', '2048'];
+    const imgModels = db.prepare("SELECT id, params_schema, rules, api_base FROM models WHERE type='text-to-image'").all();
+    for (const mm of imgModels) {
+      let schema = [];
+      try { schema = JSON.parse(mm.params_schema || '[]'); } catch (e) { schema = []; }
+      if (!Array.isArray(schema)) continue;
+      const sizeDef = schema.find(d => d && d.key === 'size');
+      const wxh = [];
+      let inferred = 1024;
+      if (sizeDef && Array.isArray(sizeDef.options)) {
+        for (const o of sizeDef.options.map(String)) {
+          const wm = /^([0-9]+)x([0-9]+)$/.exec(o);
+          if (wm) { wxh.push(o); inferred = Math.min(Number(wm[1]), Number(wm[2])); }
+        }
+      }
+      if (!schema.some(d => d && d.key === 'resolution')) {
+        const defTier = TIERS.includes(String(inferred)) ? String(inferred) : '1024';
+        const resDef = { key: 'resolution', label: '分辨率(短边)', type: 'select', options: TIERS, default: defTier };
+        schema = sizeDef ? schema.map(d => (d && d.key === 'size') ? resDef : d) : schema.concat([resDef]);
+        db.prepare('UPDATE models SET params_schema=? WHERE id=?').run(JSON.stringify(schema), mm.id);
+      }
+      /* 固定尺寸清单只对外部 API 模型保留(其清单可能来自服务商真实约束);
+         本地引擎任何尺寸都能渲染,清空限制以免压制分辨率档 */
+      if (wxh.length && mm.api_base) {
+        let rulesObj = {};
+        try { rulesObj = JSON.parse(mm.rules || '{}'); } catch (e) { rulesObj = {}; }
+        if (!rulesObj || typeof rulesObj !== 'object' || Array.isArray(rulesObj)) rulesObj = {};
+        rulesObj.limits = Object.assign({}, rulesObj.limits, { sizes: [...new Set(wxh)] });
+        db.prepare('UPDATE models SET rules=? WHERE id=?').run(JSON.stringify(rulesObj), mm.id);
+      }
+    }
+  }
+
+  /* 第三十三轮(本轮 26·3):分辨率档改为业界叫法 1K / 2K / 4K(短边像素基准),
+     原先的 512/768/1024/1280/1536/2048 数字档用户看不出含义,也与「画幅比例换算尺寸」脱节。
+     服务端 normalizeResolution 同时接受数字像素,历史任务参数照常可用 */
+  {
+    const K_TIERS = ['1K', '2K', '4K'];
+    const toK = v => {
+      const px = Number(v);
+      if (!Number.isFinite(px) || px <= 0) return '1K';
+      if (px >= 3072) return '4K';
+      if (px >= 1536) return '2K';
+      return '1K';
+    };
+    for (const mm of db.prepare("SELECT id, params_schema FROM models WHERE type='text-to-image'").all()) {
+      let schema = [];
+      try { schema = JSON.parse(mm.params_schema || '[]'); } catch (e) { schema = []; }
+      const rd = Array.isArray(schema) && schema.find(d => d && d.key === 'resolution');
+      if (!rd) continue;
+      const opts = (Array.isArray(rd.options) ? rd.options : []).map(String);
+      if (opts.length && opts.every(o => K_TIERS.includes(o))) continue; // 已是 K 档
+      const next = { ...rd, label: '分辨率', options: K_TIERS, default: toK(rd.default != null ? rd.default : (opts[0] || 1024)) };
+      db.prepare('UPDATE models SET params_schema=? WHERE id=?')
+        .run(JSON.stringify(schema.map(d => (d && d.key === 'resolution') ? next : d)), mm.id);
+    }
+  }
+
   // 增量迁移:Agnes Video 2.5 Flash 在线模型(幂等)
   //   按 doc/Agnes Video 2.5 Flash API.md 合理设置:
   //   · size 固定 720P / seconds 4-12 / reference 参考图 ≤ 5 张 / 不支持 videos
@@ -438,6 +546,8 @@ function seed() {
   if (s.freeCredits === undefined) setSetting('freeCredits', 100);
   /* 第二十轮:生成视频尺寸可配置(480p/720p/960p/2k);分辨率参数提交时以此白名单校验 */
   if (!Array.isArray(s.videoResolutions) || !s.videoResolutions.length) setSetting('videoResolutions', ['480p', '720p', '960p', '2k']);
+  /* 第二十五轮(AI 生图):每张图片积分定价(免费生图模型恒为 0) */
+  if (s.creditPerImage === undefined) setSetting('creditPerImage', 2);
 }
 
 migrate();

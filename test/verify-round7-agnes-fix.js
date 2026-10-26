@@ -188,6 +188,8 @@ async function runTask(payload) {
     });
     const v2id = mk.json && mk.json.model && mk.json.model.id;
     ok(!!v2id, '创建自定义 V2.0 模型', mk.text);
+    /* 协议回归不该消耗真实积分:测试模型一律置免费(否则 admin 余额不足会 402,断言拿不到任务) */
+    if (v2id) db.prepare('UPDATE models SET is_free=1 WHERE id=?').run(v2id);
     const C = await runTask({ model_id: v2id, use_asset_id: up.json.asset.id, prompt: '延时摄影云层流动', param_duration: 5 });
     ok(C.task && C.task.status === 'completed', '任务生成成功', C.task && C.task.error);
     const bC = captured.find(c => c.body.model === 'agnes-video-v2.0');

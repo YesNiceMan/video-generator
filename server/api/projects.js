@@ -16,9 +16,53 @@ r.get('/config', requireAuth, asyncRoute(async (req, res) => {
   const list = Array.isArray(s.videoResolutions) && s.videoResolutions.length ? s.videoResolutions : ['480p', '720p', '960p', '2k'];
   res.json({
     videoResolutions: list,
-    defaultResolution: list.includes('720p') ? '720p' : list[0]
+    defaultResolution: list.includes('720p') ? '720p' : list[0],
+    /* 第三十三轮:项目级出片规格的可选项(与前端 COMMON_FPS / 画幅下拉保持一致) */
+    aspectRatios: PROJECT_RATIOS,
+    fpsOptions: PROJECT_FPS,
+    /* 第二十五轮:生图每张积分定价(前端快捷生图弹窗计价展示用) */
+    creditPerImage: Math.max(0, Number(s.creditPerImage ?? 2))
   });
 }));
+
+/* ---------- 项目级出片规格(第三十三轮 · 项目优化 26·5) ----------
+   建项目时就定好 帧率 / 画幅比例 / 分辨率 / 单镜时长;分镜工作台新增分镜按这套参数初始化。
+   名单在前端(common.js 的 COMMON_FPS / ProjectsView 的画幅下拉)有同一份,校验口径以此处为准 */
+const PROJECT_RATIOS = ['16:9', '9:16', '4:3', '3:4', '1:1', '21:9', '3:2', '2:3'];
+const PROJECT_FPS = [23.976, 24, 25, 29.97, 30, 48, 50, 60];
+const SPEC_DEFAULT = { fps: 30, aspect_ratio: '16:9', resolution: '720p', shot_duration: 10 };
+
+function resolutionList() {
+  const list = Array.isArray(getSettings().videoResolutions) && getSettings().videoResolutions.length
+    ? getSettings().videoResolutions : ['480p', '720p', '960p', '2k'];
+  return list;
+}
+
+/* 逐项校验:非法值回退到默认(分辨率默认优先取白名单里的 720p) */
+function normSpec(raw, cur) {
+  cur = cur || {};
+  const resList = resolutionList();
+  const out = {};
+  if (raw.fps !== undefined) {
+    const f = Number(raw.fps);
+    out.fps = PROJECT_FPS.includes(f) ? f : Number(cur.fps) || SPEC_DEFAULT.fps;
+  }
+  if (raw.aspect_ratio !== undefined) {
+    const a = String(raw.aspect_ratio || '').trim();
+    out.aspect_ratio = PROJECT_RATIOS.includes(a) ? a : (PROJECT_RATIOS.includes(cur.aspect_ratio) ? cur.aspect_ratio : SPEC_DEFAULT.aspect_ratio);
+  }
+  if (raw.resolution !== undefined) {
+    const rv = String(raw.resolution || '').trim();
+    out.resolution = resList.includes(rv) ? rv
+      : (resList.includes(cur.resolution) ? cur.resolution
+        : (resList.includes('720p') ? '720p' : resList[0]));
+  }
+  if (raw.shot_duration !== undefined) {
+    /* 3–15s:与分镜卡「时长」下拉档位一致 */
+    out.shot_duration = clamp(Number(raw.shot_duration), 3, 15, Number(cur.shot_duration) || SPEC_DEFAULT.shot_duration);
+  }
+  return out;
+}
 
 const EXPORTS = path.join(DATA_DIR, 'exports');
 fs.mkdirSync(EXPORTS, { recursive: true });
@@ -91,8 +135,16 @@ r.post('/projects', requireAuth, asyncRoute(async (req, res) => {
   // 唯一邀请码
   let code; let tries = 0;
   do { code = genProjectCode(); tries++; } while (tries < 30 && db.prepare('SELECT 1 FROM projects WHERE code=?').get(code));
-  db.prepare('INSERT INTO projects(id,owner_id,name,description,cover_asset_id,code,created_at) VALUES(?,?,?,?,?,?,?)')
-    .run(id, req.user.id, name, String(req.body.description || '').slice(0, 500), req.body.cover_asset_id || null, code, now());
+  /* 出片规格:未传则用默认(30fps / 16:9 / 720p / 10s),分辨率默认对齐后台白名单 */
+  const spec = normSpec(req.body || {}, { resolution: resolutionList().includes('720p') ? '720p' : resolutionList()[0] });
+  db.prepare(`INSERT INTO projects(id,owner_id,name,description,cover_asset_id,code,fps,aspect_ratio,resolution,shot_duration,created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, req.user.id, name, String(req.body.description || '').slice(0, 500), req.body.cover_asset_id || null, code,
+      spec.fps != null ? spec.fps : SPEC_DEFAULT.fps,
+      spec.aspect_ratio || SPEC_DEFAULT.aspect_ratio,
+      spec.resolution || (resolutionList().includes('720p') ? '720p' : resolutionList()[0]),
+      spec.shot_duration != null ? spec.shot_duration : SPEC_DEFAULT.shot_duration,
+      now());
   res.json({ project: { ...projectWithTree(id), ...projectRow(db.prepare('SELECT * FROM projects WHERE id=?').get(id), req.user.id) } });
 }));
 
@@ -145,6 +197,9 @@ r.patch('/projects/:id', requireAuth, asyncRoute(async (req, res) => {
     do { code = genProjectCode(); tries++; } while (tries < 30 && db.prepare('SELECT 1 FROM projects WHERE code=?').get(code));
     db.prepare('UPDATE projects SET code=? WHERE id=?').run(code, p.id);
   }
+  /* 出片规格(帧率 / 画幅比例 / 分辨率 / 单镜时长):改后对该项目后续新增的分镜生效 */
+  const spec = normSpec(b, p);
+  for (const [k, v] of Object.entries(spec)) db.prepare(`UPDATE projects SET ${k}=? WHERE id=?`).run(v, p.id);
   res.json({ project: { ...projectWithTree(p.id), ...projectRow(db.prepare('SELECT * FROM projects WHERE id=?').get(p.id), req.user.id) } });
 }));
 

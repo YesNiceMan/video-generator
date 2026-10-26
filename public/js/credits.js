@@ -1,5 +1,5 @@
 'use strict';
-/* 积分中心:余额展示 + 申请积分 + 消耗/发放流水 + 申请记录 */
+/* 积分中心：余额展示 + 申请积分 + 消耗/发放流水 + 申请记录 */
 const CreditCenter = {
   cache: { balance: 0, pricing: { perSecond: 5, overrides: {} } },
 
@@ -16,7 +16,7 @@ const CreditCenter = {
   },
 
   /* 按段时长计算本次任务消耗
-     优先级与后端一致:免费模型 0 → 模型专属每秒单价 → 段时长覆盖价 → 全局每秒单价 */
+     优先级与后端一致：免费模型 0 → 模型专属每秒单价 → 段时长覆盖价 → 全局每秒单价 */
   costFor(durationSec, model) {
     if (model && model.is_free) return 0;
     const dur = Math.max(1, Math.round(Number(durationSec) || 5));
@@ -42,7 +42,7 @@ const CreditCenter = {
       <div class="cc-hero">
         <div class="cc-balance"><span class="cc-num">${res.balance}</span><span class="cc-unit">积分</span></div>
         <div class="cc-price">
-          定价:免费模型 0 分 · 常用段时长 ${Object.entries(res.pricing.overrides || {}).map(([d, v]) => d + 's=' + v).join(' / ')} · 其余 ${res.pricing.perSecond} 分/秒
+          定价：免费模型 0 分 · 常用段时长 ${Object.entries(res.pricing.overrides || {}).map(([d, v]) => d + 's=' + v).join(' / ')} · 其余 ${res.pricing.perSecond} 分/秒
         </div>
         <button class="btn btn-primary" id="ccApplyBtn">${iconText('hand-coins', '申请积分')}</button>
       </div>
@@ -80,14 +80,14 @@ const CreditCenter = {
         title: '申请积分',
         fields: [
           { key: 'amount', label: '申请数量', type: 'number', value: 100, hint: '1 ~ 100000,由管理员审批后到账' },
-          { key: 'reason', label: '申请用途', type: 'textarea', placeholder: '如: 本月需生成 40 集短视频素材…' }
+          { key: 'reason', label: '申请用途', type: 'textarea', placeholder: '如： 本月需生成 40 集短视频素材…' }
         ],
         submitText: '提交申请'
       });
       if (vals) {
         try {
           await API.post('/credits/apply', { amount: Number(vals.amount), reason: vals.reason });
-          toast('申请已提交,等待管理员审批', 'ok');
+          toast('申请已提交，等待管理员审批', 'ok');
           this.renderBody(body);
         } catch (e) { toast(e.message, 'err'); }
       }

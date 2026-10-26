@@ -54,7 +54,7 @@ const EXPR_CHIP = [
   "  window.__prevScript = sh0.script;",
   "  window.__prevRefs = JSON.parse(JSON.stringify(ProjectsView.studio.refs));",
   // 二十二·1:占位符仅链接「参考资产」——用库内真实图片资产注入参考面板
-  "  var imgs = ProjectsView.studio.assets.filter(function(a){ return a.type === 'image'; }).slice(0, 2);",
+  "  var imgs = ProjectsView.studio.assets.filter(function(a){ return a.type === 'image'; }).sort(function(a, b){ return String(a.name).length - String(b.name).length; }).slice(0, 2);",
   "  if (imgs.length < 2) return JSON.stringify({ skipped: true });",
   "  ProjectsView.studio.refs = imgs.map(function(a, i){ return Object.assign({}, a, { refType: i === 0 ? '角色' : '场景' }); });",
   "  ProjectsView.renderStudioBody();",

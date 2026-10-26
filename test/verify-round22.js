@@ -153,25 +153,32 @@ async function main() {
   console.log('== C. 22·2 点击 chips / 左侧参考资产 → 放大查看 ==');
   await ev("document.querySelector('.pl-chip.ok').click()", page);
   await wait(450);
-  const m1 = JSON.parse(await ev("JSON.stringify({ open: !!document.querySelector('.modal-mask'), media: !!(document.querySelector('.modal-mask img.pv-media')), name: (document.querySelector('.pv-meta .pv-name')||{}).textContent, tag: (document.querySelector('.pv-tag')||{}).textContent, dl: !!document.querySelector('.modal-foot a[href*=\"/api/assets/\"]') })", page));
+  /* 二十九轮:放大预览升级为全站统一「成果查看器」(.viewer-mask 黑场大图) */
+  const m1 = JSON.parse(await ev("JSON.stringify({ open: !!document.querySelector('.viewer-mask'), media: !!(document.querySelector('.viewer-mask img.pv-media')), name: (document.querySelector('.pv-meta .pv-name')||{}).textContent, tag: (document.querySelector('.pv-tag')||{}).textContent, dl: !!document.querySelector('.viewer-foot a[href*=\"/api/assets/\"]') })", page));
   check('点击 chip 弹出放大预览', m1.open && m1.media, m1);
   check('预览显示资产名与参考标记', m1.name === '1.png' && String(m1.tag || '').indexOf('已加入参考资产') >= 0, { name: m1.name, tag: m1.tag });
   check('预览含下载按钮', m1.dl);
   await shot(page, 'preview-chip.png');
-  await ev("document.querySelector('.modal-mask .modal-x').click()", page);
+  await ev("document.querySelector('.viewer-mask .viewer-x').click()", page);
   await wait(350);
-  check('预览可关闭', (await ev("!document.querySelector('.modal-mask')", page)) === true);
+  check('预览可关闭', (await ev("!document.querySelector('.viewer-mask')", page)) === true);
 
+  /* 三十二轮交互调整：左侧参考卡「单击=选用」，放大查看改由角标/双击触发。
+     原来单击即弹全屏，想安静地换一张源图必须每次关掉遮罩 */
   await ev("document.querySelector('.ws-ref-item').click()", page);
   await wait(500);
-  const m2 = JSON.parse(await ev("JSON.stringify({ open: !!document.querySelector('.modal-mask'), media: !!(document.querySelector('.modal-mask img.pv-media')), name: (document.querySelector('.pv-meta .pv-name')||{}).textContent })", page));
-  check('点击左侧参考资产弹出放大预览', m2.open && m2.media, m2);
+  const m2 = JSON.parse(await ev("JSON.stringify({ open: !!document.querySelector('.viewer-mask'), sel: !!(document.querySelector('.ws-ref-item.sel')) })", page));
+  check('单击参考卡只选用、不弹全屏', m2.open === false && m2.sel === true, m2);
   check('选用状态同步(selRef 指向点击项)', (await ev("ProjectsView.studio.selRef && ProjectsView.studio.selRef.name", page)) === '2.png');
   check('左侧参考卡带放大镜角标', (await ev("document.querySelectorAll('.ws-ref-item .ws-ref-zoom svg').length", page)) === 2);
+  await ev("document.querySelector('.ws-ref-item .ws-ref-zoom').click()", page);
+  await wait(450);
+  const m2b = JSON.parse(await ev("JSON.stringify({ open: !!document.querySelector('.viewer-mask'), media: !!(document.querySelector('.viewer-mask img.pv-media')), name: (document.querySelector('.pv-meta .pv-name')||{}).textContent })", page));
+  check('点角标放大查看', m2b.open && m2b.media, m2b);
   await shot(page, 'preview-ref.png');
-  await ev("document.querySelector('.modal-mask .modal-x').click()", page);
+  await ev("document.querySelector('.viewer-mask .viewer-x').click()", page);
   await wait(350);
-  check('预览可关闭(2/2)', (await ev("!document.querySelector('.modal-mask')", page)) === true);
+  check('预览可关闭(2/2)', (await ev("!document.querySelector('.viewer-mask')", page)) === true);
 
   console.log('== D. 22·3 引用字体与形状放大 ==');
   const refExpr2 = "ProjectsView.studio.assets.filter(function(a){ return ['1.png','2.png'].indexOf(a.name) >= 0; }).map(function(a,i){ return Object.assign({}, a, { refType: i === 0 ? '角色' : '场景' }); }).concat([{ id: 'a-fake-typo', name: '女主角之觉醒.png', type: 'image', refType: '角色' }])";

@@ -41,4 +41,27 @@ function clamp(v, min, max, def) {
   return Math.min(max, Math.max(min, n));
 }
 
-module.exports = { uid, now, httpError, asyncRoute, ensureDir, cleanTags, clamp };
+/* 网关排队/限流(HTTP 429/502/503/504,如 Agnes 的 video_queue_full)是可恢复状态:
+   抛带 retryable 标记的错误,由 worker 延迟重投,而不是占用任务槽原地干等 */
+const BUSY_STATUS = [429, 502, 503, 504];
+
+function busyError(status, detail, holdMs) {
+  const e = new Error('创建任务失败(HTTP ' + status + '): ' + detail);
+  e.retryable = true;
+  e.holdMs = Math.max(0, Math.min(Number(holdMs) || 0, 300e3));
+  return e;
+}
+
+/* Retry-After 头(秒或 HTTP 日期),没有则返回 0 由调用方走退避阶梯 */
+function retryAfterMs(res) {
+  try {
+    const h = res.headers && res.headers.get && res.headers.get('retry-after');
+    if (!h) return 0;
+    const n = Number(h);
+    if (Number.isFinite(n) && n > 0) return n * 1000;
+    const d = Date.parse(h);
+    return Number.isNaN(d) ? 0 : d - Date.now();
+  } catch (e) { return 0; }
+}
+
+module.exports = { uid, now, httpError, asyncRoute, ensureDir, cleanTags, clamp, BUSY_STATUS, busyError, retryAfterMs };

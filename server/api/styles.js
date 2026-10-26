@@ -13,11 +13,18 @@ r.get('/models', asyncRoute(async (req, res) => {
   const isAdmin = req.user.role === 'admin';
   const sql = isAdmin ? 'SELECT * FROM models ORDER BY created_at' : 'SELECT * FROM models WHERE enabled=1 ORDER BY created_at';
   const { parseRules, detectProtocol } = require('../adapters');
-  const rows = db.prepare(sql).all().map(m => ({
-    ...m, params_schema: JSON.parse(m.params_schema || '[]'),
-    rules: parseRules(m), protocol: detectProtocol(m),
-    api_key: undefined, has_api_key: !!m.api_key, api_key_tail: m.api_key ? m.api_key.slice(-4) : ''
-  }));
+  const img = require('../imagegen');
+  const rows = db.prepare(sql).all().map(m => {
+    /* 生图模型按生图协议暴露能力 / 档位 / 尺寸形态:分镜工作台的快捷生图与生图页共用这份模型表,
+       此前只带视频适配器的 protocol 且没有 caps,弹窗里连「参考图」都不出现 */
+    const isImg = m.type === 'text-to-image';
+    return {
+      ...m, params_schema: JSON.parse(m.params_schema || '[]'),
+      rules: parseRules(m), protocol: isImg ? undefined : detectProtocol(m),
+      ...(isImg ? img.imageSpecMeta(m) : {}),
+      api_key: undefined, has_api_key: !!m.api_key, api_key_tail: m.api_key ? m.api_key.slice(-4) : ''
+    };
+  });
   res.json({ items: rows });
 }));
 

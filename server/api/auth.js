@@ -38,9 +38,12 @@ r.get('/me', asyncRoute(async (req, res) => {
   res.json({ user: publicUser(u) });
 }));
 
-// 站内通知
+// 站内通知:带上任务所属项目/分集，前端才能直接跳到那一集（此前只能落到项目分集列表）
 r.get('/notifications', requireAuth, asyncRoute(async (req, res) => {
-  const rows = db.prepare('SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 30').all(req.user.id);
+  const rows = db.prepare(`
+    SELECT n.*, t.project_id AS task_project_id, t.episode_id AS task_episode_id
+    FROM notifications n LEFT JOIN tasks t ON t.id = n.task_id
+    WHERE n.user_id=? ORDER BY n.created_at DESC LIMIT 30`).all(req.user.id);
   const unread = db.prepare('SELECT COUNT(*) c FROM notifications WHERE user_id=? AND read=0').get(req.user.id).c;
   res.json({ items: rows, unread });
 }));

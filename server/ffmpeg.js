@@ -65,6 +65,25 @@ async function makeThumb(videoPath, thumbPath) {
   return thumbPath;
 }
 
+/* 视频分辨率档 → 短边像素(名单与后台「系统设置 → 生成视频尺寸」一致) */
+const VIDEO_RES_EDGES = { '480p': 480, '720p': 720, '960p': 960, '1080p': 1080, '2k': 1440, '4k': 2160 };
+
+/* 分辨率档 × 画幅比例 → 具体宽高(取偶数,yuv420p 要求;长边上限 4096)。
+   解析不出比例时按 16:9 / 720p 回退。 */
+function videoWH(resolution, aspectRatio) {
+  let short = VIDEO_RES_EDGES[String(resolution || '').trim().toLowerCase()] || 720;
+  const m = /^([0-9.]+)\s*[:x/／]\s*([0-9.]+)$/.exec(String(aspectRatio || '').trim());
+  let rw = 16, rh = 9;
+  if (m) {
+    const a = parseFloat(m[1]), b = parseFloat(m[2]);
+    if (a > 0 && b > 0) { rw = a; rh = b; }
+  }
+  const even = v => Math.max(2, Math.round(v / 2) * 2);
+  const long = Math.max(rw, rh), shortSide = Math.min(rw, rh);
+  if (short * long / shortSide > 4096) short = Math.floor(4096 * shortSide / long);
+  return rw >= rh ? { w: even(short * rw / rh), h: even(short) } : { w: even(short), h: even(short * rh / rw) };
+}
+
 // 风格 → 色彩滤镜
 const GRADE_FILTERS = {
   '影视': 'eq=contrast=1.08:saturation=0.88:brightness=-0.015,colorbalance=rs=0.05:bs=-0.05',
@@ -77,19 +96,24 @@ const GRADE_FILTERS = {
 
 /**
  * 图生视频:对单张图片做镜头推拉 + 风格调色,生成 MP4
- * @param {object} o {input, output, duration, fps, motion, seed, grade}
+ * @param {object} o {input, output, duration, fps, motion, seed, grade, resolution, aspect_ratio}
  */
 async function generateI2V(o) {
-  const duration = Math.max(2, Math.min(10, o.duration || 5));
+  const duration = Math.max(2, Math.min(20, o.duration || 5));
   const fps = o.fps || 30;
   const motion = Math.max(0, Math.min(1, o.motion ?? 0.5));
+  /* 尺寸由「分辨率档 × 画幅比例」换算(第三十三轮):此前固定 1280×720,
+     项目/分镜设置的分辨率与画幅在本地渲染管线上完全没有体现 */
+  const { w, h } = videoWH(o.resolution, o.aspect_ratio);
   const total = Math.ceil(duration * fps);
   const speed = (0.0008 + motion * 0.0028).toFixed(5);
   const maxz = (1.04 + motion * 0.7).toFixed(3);
-  const w = 1280, h = 720;
+  /* zoompan 前把源图放大到输出的数倍可消除抖动;大图按比例收敛,避免内存爆炸 */
+  const longEdge = Math.max(w, h);
+  const mul = longEdge * 6 > 8192 ? Math.max(2, Math.floor(8192 / longEdge)) : 6;
   const grade = GRADE_FILTERS[o.grade] || 'eq=contrast=1.05:saturation=1.05';
   const vf = [
-    `scale=${w * 6}:-2`,
+    `scale=${w * mul}:-2`,
     `zoompan=z='min(zoom+${speed},${maxz})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${total}:s=${w}x${h}:fps=${fps}`,
     `fps=${fps}`,
     grade,
@@ -132,4 +156,4 @@ async function exportEpisode(o) {
   return o.output;
 }
 
-module.exports = { FFMPEG, run, probe, makeThumb, generateI2V, exportEpisode };
+module.exports = { FFMPEG, run, probe, makeThumb, generateI2V, exportEpisode, videoWH, VIDEO_RES_EDGES };

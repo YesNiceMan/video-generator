@@ -1,6 +1,9 @@
 node_modules/
 data/
-test/shots/
+# 只忽略回归截图,不忽略 test/ 里的验证脚本
+test/shots*/
+.shots/
+.DS_Store
 .npm-cache/
 .brew-cache/
 tools/

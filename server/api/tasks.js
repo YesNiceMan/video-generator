@@ -7,6 +7,7 @@ const multer = require('multer');
 const { requireAuth } = require('../auth');
 const { asyncRoute, httpError, uid, now, clamp, ensureDir } = require('../util');
 const { db, getSettings, DATA_DIR } = require('../db');
+const { snapAspect, snapTier } = require('../imagegen');
 const { enqueue, pump } = require('../worker');
 const credits = require('../credits');
 
@@ -15,6 +16,37 @@ r.use(requireAuth);
 
 const TMP = path.join(DATA_DIR, 'tmp');
 ensureDir(TMP);
+
+/* 模型侧硬约束:画幅比例 / 分辨率按该模型声明的清单就近吸附
+   (清单来源:params_schema 的 aspect_ratio/ratio 选项 + rules.limits.aspect_ratios /
+    fixed_size / resolutions —— 新增网关只改后台规则,不改这段代码) */
+function applyModelSpec(model, params) {
+  if (!model || !params) return params;
+  let rules = {}, schema = [];
+  try { rules = JSON.parse(model.rules || '{}') || {}; } catch (e) { rules = {}; }
+  try { schema = JSON.parse(model.params_schema || '[]') || []; } catch (e) { schema = []; }
+  if (!rules || typeof rules !== 'object') rules = {};
+  if (!Array.isArray(schema)) schema = [];
+  const lim = rules.limits || {};
+  const arDef = schema.find(d => d && (d.key === 'aspect_ratio' || d.key === 'ratio')
+    && Array.isArray(d.options) && d.options.length);
+  const arList = ((arDef ? arDef.options : (Array.isArray(lim.aspect_ratios) ? lim.aspect_ratios : [])) || [])
+    .map(String).filter(Boolean);
+  if (params.aspect_ratio && arList.length && !arList.includes(String(params.aspect_ratio))) {
+    const snapped = snapAspect(String(params.aspect_ratio), arList);
+    if (snapped) params.aspect_ratio = snapped;
+  }
+  const fixed = String(lim.fixed_size || '').trim();
+  if (params.resolution) {
+    if (fixed) {
+      if (String(params.resolution).toUpperCase() !== fixed.toUpperCase()) params.resolution = fixed.toLowerCase();
+    } else if (Array.isArray(lim.resolutions) && lim.resolutions.length) {
+      const t = snapTier(String(params.resolution), lim.resolutions);
+      if (t) params.resolution = t;
+    }
+  }
+  return params;
+}
 
 const TYPE_BY_MIME = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' };
 const storage = multer.diskStorage({
@@ -28,7 +60,14 @@ function taskJSON(t) {
   const linked = linkedIds
     .map(id => db.prepare('SELECT id,type,name,thumb_path FROM assets WHERE id=?').get(id))
     .filter(Boolean);
-  return { ...t, params: JSON.parse(t.params || '{}'), linked_asset_ids: linkedIds, linked_assets: linked };
+  /* 第二十五轮:生图任务的多图结果(result_asset_ids JSON 数组) */
+  let resultAssets = [];
+  try {
+    resultAssets = JSON.parse(t.result_asset_ids || '[]')
+      .map(id => db.prepare('SELECT id,type,name,thumb_path,width,height FROM assets WHERE id=?').get(id))
+      .filter(Boolean);
+  } catch (e) { resultAssets = []; }
+  return { ...t, params: JSON.parse(t.params || '{}'), linked_asset_ids: linkedIds, linked_assets: linked, result_assets: resultAssets };
 }
 
 /* 校验占位符链接的资源(必须本人拥有或共享给我) */
@@ -121,6 +160,10 @@ r.post('/', upload.single('image'), asyncRoute(async (req, res) => {
     const want = String(b.param_resolution);
     params['resolution'] = resList.includes(want) ? want : resList.includes('720p') ? '720p' : resList[0];
   }
+  /* 模型侧硬约束(需求 26·9):画幅比例与分辨率最终以「该模型声明的清单」为准收敛 ——
+     平台白名单只管到「允许选哪些」,网关只吃 720P 之类的模型自己写在 rules.limits 里,
+     否则用户设了 2K 提交到固定 720P 的模型就会吃一个 HTTP 400。 */
+  applyModelSpec(model, params);
 
   // 风格覆盖参数
   let style = null;

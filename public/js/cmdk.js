@@ -1,6 +1,6 @@
 'use strict';
-/* Cmd+K / Ctrl+K 命令面板:快速跳转页面与项目、执行常用操作
-   —— 十六·1「操作更加方便」核心交互。自包含,不侵入既有视图逻辑 */
+/* Cmd+K / Ctrl+K 命令面板：快速跳转页面与项目、执行常用操作
+   —— 十六·1「操作更加方便」核心交互。自包含，不侵入既有视图逻辑 */
 const CmdK = {
   mask: null, input: null, list: null,
   items: [], filtered: [], sel: 0, open: false,
@@ -32,7 +32,7 @@ const CmdK = {
     /* 输入过滤 */
     this.input.addEventListener('input', () => { this.sel = 0; this.render(); });
 
-    /* 键盘:全局快捷键 + 面板内导航(捕获阶段确保优先) */
+    /* 键盘：全局快捷键 + 面板内导航(捕获阶段确保优先) */
     document.addEventListener('keydown', e => {
       const k = e.key;
       if ((e.metaKey || e.ctrlKey) && String(k).toLowerCase() === 'k') {
@@ -82,10 +82,12 @@ const CmdK = {
       mkPage('首页 · 创作概览', '/', 'layout-dashboard'),
       mkPage('项目分集', '/projects', 'film'),
       mkPage('资产库', '/assets', 'folder-open'),
-      mkPage('风格库', '/styles', 'palette')
+      mkPage('风格库', '/styles', 'palette'),
+      mkPage('AI 生图', '/images', 'image-plus')
     ];
     if (admin) pages.push(mkPage('后台管理', '/admin', 'settings'));
-    const projs = (App.projects || []).slice(0, 10).map(p => ({
+    /* 项目跳转：顶栏不再常驻项目切换器，统一由命令面板承担 */
+    const projs = (App.projects || []).slice(0, 40).map(p => ({
       group: '项目', label: p.name,
       sub: p.episode_count + ' 集 · ' + (p.task_count || 0) + ' 任务',
       ico: 'clapperboard',
@@ -93,8 +95,10 @@ const CmdK = {
     }));
     const acts = [
       { group: '快速操作', label: '新建项目', sub: '创建剧集项目并获得邀请码', ico: 'plus', run: () => CmdK.actNewProject() },
+      { group: '快速操作', label: '上传素材到资产库', sub: '图片 / 视频 / 音频', ico: 'upload', run: () => { location.hash = '#/assets'; setTimeout(() => AssetsView.showUploadDialog(), 260); } },
       { group: '快速操作', label: '打开积分中心', sub: () => '余额 ' + ((App.user && App.user.credits) || 0), ico: 'coins', run: () => CreditCenter.open() },
       { group: '快速操作', label: '查看通知', sub: '未读消息与任务提醒', ico: 'bell', run: () => App.toggleNotifs() },
+      { group: '快速操作', label: () => (App.currentScheme() === 'light' ? '切换到深色模式' : '切换到浅色模式'), sub: '顶栏右侧也可随时切换', ico: 'sun-moon', run: () => App.toggleScheme() },
       { group: '快速操作', label: '退出登录', sub: App.user ? App.user.name : '', ico: 'log-out', run: async () => {
           await API.post('/auth/logout'); location.hash = '#/login'; App.boot();
         } }
@@ -106,11 +110,13 @@ const CmdK = {
 
   filter(q) {
     q = String(q == null ? '' : q).trim().toLowerCase();
-    const all = this.items.map(it => ({ it: it, sub: typeof it.sub === 'function' ? it.sub() : (it.sub || '') }));
+    /* label / sub 允许是函数，便于展示随状态变化的文案(如"切换到深色模式"、余额) */
+    const resolve = it => ({ it: it, label: typeof it.label === 'function' ? it.label() : it.label, sub: typeof it.sub === 'function' ? it.sub() : (it.sub || '') });
+    const all = this.items.map(resolve);
     if (!q) return all;
     const rows = [];
     for (const x of all) {
-      const hay = (x.it.label + ' ' + x.sub).toLowerCase();
+      const hay = (x.label + ' ' + x.sub).toLowerCase();
       let i = -1, score = 0, streak = 0, firstAt = -1, ok = true;
       for (const ch of q) {
         const j = hay.indexOf(ch, i + 1);
@@ -121,7 +127,7 @@ const CmdK = {
         i = j;
       }
       if (!ok) continue;
-      rows.push({ it: x.it, sub: x.sub, _score: score - firstAt });
+      rows.push({ it: x.it, label: x.label, sub: x.sub, _score: score - firstAt });
     }
     rows.sort((a, b) => b._score - a._score);
     return rows;
@@ -131,7 +137,7 @@ const CmdK = {
     const rows = this.filter(this.input.value);
     this.filtered = rows.map(r => r.it);
     if (!rows.length) {
-      this.list.innerHTML = '<div class="cmdk-empty">没有匹配的结果,换个关键词试试</div>';
+      this.list.innerHTML = '<div class="cmdk-empty">没有匹配的结果，换个关键词试试</div>';
       return;
     }
     let html = '', lastGroup = null;
@@ -142,7 +148,7 @@ const CmdK = {
       }
       html += '<div class="cmdk-item' + (idx === this.sel ? ' sel' : '') + '" data-idx="' + idx + '">'
         + icon(r.it.ico)
-        + '<div><div>' + esc(r.it.label) + '</div>' + (r.sub ? '<div class="ci-sub">' + esc(r.sub) + '</div>' : '') + '</div>'
+        + '<div><div>' + esc(r.label) + '</div>' + (r.sub ? '<div class="ci-sub">' + esc(r.sub) + '</div>' : '') + '</div>'
         + '<span class="ci-go">' + icon('corner-down-left') + '</span>'
         + '</div>';
     });
@@ -176,22 +182,8 @@ const CmdK = {
   }
 };
 
-/* 新建项目:与首页同款表单 */
-CmdK.actNewProject = async function () {
-  const vals = await formModal({
-    title: '新建项目',
-    fields: [
-      { key: 'name', label: '项目名称', placeholder: '如:《山海录》第一季', value: '' },
-      { key: 'description', label: '项目描述', type: 'textarea', placeholder: '选填', value: '' }
-    ],
-    submitText: '创建'
-  });
-  if (vals) {
-    const out = await API.post('/projects', vals);
-    toast('项目已创建 · 邀请码 ' + out.project.code, 'ok');
-    location.hash = '#/projects/' + out.project.id;
-  }
-};
+/* 新建项目：与首页/项目分集页同一套表单(含 26·5 的出片规格设置) */
+CmdK.actNewProject = function () { return ProjectsView.newProjectDialog(); };
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => CmdK.boot());
 else CmdK.boot();

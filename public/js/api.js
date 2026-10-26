@@ -10,7 +10,7 @@ const API = {
     }
     let res;
     try { res = await fetch(this.base + url, opts); }
-    catch (e) { throw new Error('网络连接失败,请检查服务是否运行'); }
+    catch (e) { throw new Error('网络连接失败，请检查服务是否运行'); }
     let data = null;
     try { data = await res.json(); } catch (e) { /* 非 JSON */ }
     if (!res.ok) {
@@ -29,7 +29,7 @@ const API = {
   upload(url, formData) { return this.request('POST', url, formData, true); }
 };
 
-/* 上传文件辅助:把文件 POST 到指定接口 */
+/* 上传文件辅助：把文件 POST 到指定接口 */
 async function uploadFile(url, file, extra) {
   const fd = new FormData();
   fd.append('file', file);
