@@ -7,6 +7,7 @@ const multer = require('multer');
 const { requireAuth } = require('../auth');
 const { asyncRoute, httpError, uid, now, clamp, ensureDir } = require('../util');
 const { db, getSettings, DATA_DIR } = require('../db');
+const storage = require('../storage');
 const { snapAspect, snapTier } = require('../imagegen');
 const { enqueue, pump } = require('../worker');
 const credits = require('../credits');
@@ -49,23 +50,25 @@ function applyModelSpec(model, params) {
 }
 
 const TYPE_BY_MIME = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' };
-const storage = multer.diskStorage({
+const tmpStore = multer.diskStorage({
   destination: (req, file, cb) => cb(null, TMP),
   filename: (req, file, cb) => cb(null, uid('tmp-') + '.' + (TYPE_BY_MIME[file.mimetype] || 'bin'))
 });
-const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
+const upload = multer({ storage: tmpStore, limits: { fileSize: 50 * 1024 * 1024 } });
 
 function taskJSON(t) {
   const linkedIds = JSON.parse(t.linked_asset_ids || '[]');
   const linked = linkedIds
     .map(id => db.prepare('SELECT id,type,name,thumb_path FROM assets WHERE id=?').get(id))
-    .filter(Boolean);
+    .filter(Boolean)
+    .map(storage.assetBrief);
   /* 第二十五轮:生图任务的多图结果(result_asset_ids JSON 数组) */
   let resultAssets = [];
   try {
     resultAssets = JSON.parse(t.result_asset_ids || '[]')
       .map(id => db.prepare('SELECT id,type,name,thumb_path,width,height FROM assets WHERE id=?').get(id))
-      .filter(Boolean);
+      .filter(Boolean)
+      .map(storage.assetBrief);
   } catch (e) { resultAssets = []; }
   return { ...t, params: JSON.parse(t.params || '{}'), linked_asset_ids: linkedIds, linked_assets: linked, result_assets: resultAssets };
 }
@@ -112,7 +115,7 @@ r.post('/', upload.single('image'), asyncRoute(async (req, res) => {
     if (user.storage_used + req.file.size > user.storage_quota) { fs.unlinkSync(finalPath); throw httpError(413, '存储配额不足'); }
     db.prepare(`INSERT INTO assets(id,owner_id,type,name,size,mime,path,width,height,duration,tags,source,created_at)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(id, req.user.id, 'image', req.file.originalname || '上传图片.jpg', req.file.size, req.file.mimetype, finalPath,
+      .run(id, req.user.id, 'image', req.file.originalname || '上传图片.jpg', req.file.size, req.file.mimetype, storage.toKey(finalPath),
         info.width, info.height, info.duration, JSON.stringify(['i2v-source']), 'upload', now());
     db.prepare('UPDATE users SET storage_used=storage_used+? WHERE id=?').run(req.file.size, req.user.id);
     sourceAssetId = id;
@@ -224,8 +227,8 @@ r.get('/', asyncRoute(async (req, res) => {
   sql += ' ORDER BY created_at DESC LIMIT 100';
   const rows = db.prepare(sql).all(...params).map(taskJSON);
   const withMedia = rows.map(t => {
-    const src = t.source_asset_id ? db.prepare('SELECT id,type,name,path,thumb_path,width,height FROM assets WHERE id=?').get(t.source_asset_id) : null;
-    const resA = t.result_asset_id ? db.prepare('SELECT id,type,name,path,thumb_path,width,height,duration FROM assets WHERE id=?').get(t.result_asset_id) : null;
+    const src = t.source_asset_id ? storage.assetBrief(db.prepare('SELECT id,type,name,path,thumb_path,width,height FROM assets WHERE id=?').get(t.source_asset_id)) : null;
+    const resA = t.result_asset_id ? storage.assetBrief(db.prepare('SELECT id,type,name,path,thumb_path,width,height,duration FROM assets WHERE id=?').get(t.result_asset_id)) : null;
     return { ...t, source: src, result: resA };
   });
   res.json({ items: withMedia });

@@ -5,7 +5,9 @@
 ## 🎨 设计系统(「鎏金胶片 Ciné Noir」v4)
 
 - **单一令牌层**(`public/css/app.css` 顶部 `:root`):间距 4 的倍数、字号 8 档(11/12/13/14/17/22/28)、圆角 4 档、表面三级、阴影三级;组件不再硬编码尺寸,装饰金与「小号金色正文」分别用 `--gold` / `--gold-text`。
-- **配色**:影棚暖黑画布 · 鎏金主色 · 定位绿(成功)/ 琥珀(进行)/ 朱红(失败);顶栏右侧 ☀/☾ 一键切换**浅色「画廊白」**并持久化。
+- **配色**:深色 = 影棚暖黑画布 · 鎏金主色;浅色 = 「青白 · 疏朗」(冷雾画布 + 纯白卡片浮起 + 青蓝 #2a76ba 强调 + 放宽一档的留白,第四十五轮起不再沿用金色,也不靠发丝线分层)。两套共用同一批令牌名,顶栏右侧 ☀/☾ 一键切换并持久化。语义色两套通用:定位绿(成功)/ 琥珀(进行)/ 朱红(失败)。
+- **浅色模式只换令牌、不覆盖组件**:底纹 `rgba(var(--film), a)`(深=白雾 / 浅=墨雾),品牌色雾·描边·聚焦环 `rgba(var(--accent*-rgb), a)`,色块上的字 `--ok-ink / --warn-ink / --danger-ink / --gold-ink`,小号强调字 `--gold-text`;**空间与层级也是令牌** —— `--gap / --pad-card / --row-py / --pad-page / --fs-page-title / --card-shadow / --sel-fill` 在深色里全部等于原值,浅色靠它们把疏朗与层次拉开。浅色段(`section 29`)因此不出现 `html[data-scheme=light] .btn{…}` 这类会压过 `.btn-primary` / `.cat-chip.on` 权重的高优规则。
+- **元素族(31·需求三十一)**:芯片 / 徽标 / 计数药丸 / 方形图标按钮各有唯一几何 —— 圆角只用 `--r-xs·sm·md·lg·full`,微间距只用 `--gap-xs`,控件高只用 `--h-2xs·xs·sm·md·lg` 与 `--sq-sm·md`;选中态分强弱两级(`--sel-*` 与 `--sel-soft-*`,浅色下收敛为同一种淡蓝),卡片选中用 `--sel-ring`,聚焦环只有 `--ring`;压在图片上的浮层统一 `--scrim-rgb / --scrim-ink / --scrim-line`。`test/verify-round44-light-menu.js` 的 G 段会实测每族成员的 height/圆角/字号并拒绝再次漂移。
 - **全站一条顶栏**:常规页面显示主导航;进入项目 / 分集层级时,顶栏左侧改由 `App.setContext()` 渲染「返回 + 层级标识 + 视图切换」,不再各页面自建外壳。窄屏主导航折叠为「导航」下拉。
 - **动作分层**:页头只放主行动与次级菜单,筛选控件独立成行;批量操作以浮条按需出现。
 
@@ -119,6 +121,448 @@ video-generator/
   ```
   不配 `query` 时轮询自动按 `{create.path}/{job_id}` GET,正好命中 LTX 的查询端点。
 - 验证:Mock LTX 网关跑 `adapters.run()` 9 项全过(`duration` 保持数字类型、`resolution` 出像素串、嵌套 `video_url` 解析并下载、进度回调推进);回归 `verify-round12-adapters.js` 29 项、`verify-round7-agnes-fix.js` 26 项、`verify-round36-busy-requeue.js` 27 项全绿。
+
+
+## 第四十九轮优化(需求三十二 · 浅色模式清掉最后一批旧配色元素)
+
+需求：「浅色模式下还是有旧的配色元素」，附三张截图：生图记录卡上的「生成中」棕色角标、「已取消」深色角标、「失败」红角标 + 原始 JSON。
+
+### 先量测：按色相扫，而不是按「旧金色字面值」扫
+
+第四十四轮那条「无鎏金残留」断言是拿一份**旧金色字面值清单**比对的，而且为了不误伤语义色，把 `--warn / --gold / --danger` 的当前令牌值整体加进了白名单 —— 于是浅色 `--warn` 本身就是棕橙 `#a85a12`，棕色角标顺理成章地被判成「合法语义色」放过去了。这一轮改成**按 HSL 色相扫**（色相 12–78°、饱和度 ≥ 0.14，深浅 × 10 个页面），再把现场不一定出现的状态做成固定样本来量。量出来的七处：
+
+| # | 现象 | 实测 | 根因 |
+| --- | --- | --- | --- |
+| 1 | 「生成中」角标是棕色，同卡片下方的进度条是主色蓝 | `rgb(168,90,18)` hue=29 | **状态语义放错族**：进行中 ≠ 警告，一直复用 `--warn` |
+| 2 | 淡底芯片的底色仍是深色主题那套亮琥珀 / 亮绿 | 66 处 `rgba(65,207,144,.14)` 一类字面值写死在组件里 | 组件把**某一副主题**的色板写死了，浅色只能跟着穿深色衣服 |
+| 3 | 「已取消 / 排队中」角标是一块深底浮层 | `rgba(18,32,48,.78)` 压在 `#e9f1f8` 占位块上 | 浮层语言只对**照片**成立；没出图时底下是占位灰块，深底就成了残留 |
+| 4 | 参考资产的来源角标看不见 | 深蓝字压深底，对比 **0.55:1** | 浅色段那串「逐条补白字」的覆盖清单漏了它 |
+| 5 | 已完成角标（实底绿）上的字看不见 | **1.21:1** | `html[data-scheme=light] .status-completed{color:#136c47}` 权重 (0,2,1) 压过 `.ig-card-flag .status-completed` (0,2,0) —— 第 44 轮立的权重陷阱，换了个地方复发 |
+| 6 | 成果卡页脚没有钉在卡片底部 | `margin-top` 被写成 `margintop` | 第 47 轮那条「margin-top:auto 收住页脚」从头到尾是空转的 |
+| 7 | 缩略图上的名字条 / 播放键悬停是暖黑 | `rgba(8,6,4,.82)`、`rgba(22,16,8,.8)` 硬编码 | 没走 `--scrim` |
+
+### 改法
+
+1. **语义色底纹令牌化**：新增 `--ok-rgb / --warn-rgb / --danger-rgb / --info-rgb`，66 处字面值全部改成 `rgba(var(--ok-rgb), .14)` 这种写法 —— 深色逐位不变，浅色整族跟着翻。两档三元组是量出来的而不是随手挑的：浅色直接用 `--ok` 的深绿做 14% 底，淡底会把 11px 粗体字压到 4.46:1，所以取中间调 `46,158,114`（→4.58）与 `222,96,88`（→4.54）。
+2. **`--proc` 四件套**（实底 / 实底上的字 / 淡底上的字 / 淡底配方）：深色 = 琥珀（鎏金身份不动），浅色 = 主色蓝。`.status-processing`、成果卡角标、`.cc-pending` 三处一起换 —— 「进行中」从此和它自己的进度条同色。
+3. **`--flag-idle` 三件套**：还没出图的卡片角标在浅色下是白底 + 墨字 + 一圈影子，深色仍是深底浮层。
+4. **浮层统一交给 `--scrim-ink / --scrim-line / --scrim-accent`**：删掉浅色段那 13 个选择器的白字补丁（漏一个就是一个看不见的角标），组件规则自己读令牌；`.ws-ref-tag` 的金色标签在浅色下走 `--scrim-accent: #ffffff`。新增 `--surface-sunk` 表达「占位底比表面更暗一档」这层关系（深色是更亮一档，所以必须可翻）。
+5. **删两条过时的浅色浓度补偿**（`.status-completed` / `.ws-log-state.ok` 的 `#136c47`）：浅色 `--ok` 现在本身就是深绿，补偿不但多余，还把实底角标的字压成看不见。
+6. `.status-cancelled` 的字色 `--ink-3 → --ink-2`（深色 4.38 → 6.33），修 `margintop` 拼写，暖黑字面值走 `--scrim`。
+7. **保留的暖色只有真警告**：`.ws-need-src`（缺前置条件提示）、`.cc-delta.minus`（积分减少）、`.fav-btn.on`（收藏星）仍用 `--warn` —— 它们是语义警告，不是旧品牌金。
+8. **顺手修掉截图里那屏代码**：第三张图的失败卡片铺的是整坨网关响应体 JSON。新增 `errBrief(s)`（[public/js/ui.js:64](file:///Users/a123/Desktop/test/video-generator/public/js/ui.js#L64)）：先抠 `error.message / message / detail`，抠不到就按响应里的 `status` 概括成「上游返回 status=queued，未产出结果」，再退化成截断原文（90 字 + 省略号）；完整内容留在卡片 `title` 与工作台「工作日志」详情里，成果卡 / 分镜记录卡 / 时间线 / 失败 toast / 模型自检 toast 五处一起换。
+
+### 验证
+
+`test/verify-round44-light-menu.js` 由 267 项扩到 **300 项全过**：
+
+- A 段新增 12 条静态契约 —— 语义字面值清零、`--proc` / `--flag-idle` 两族在两套主题各自定义、深底浮层不得写 `color: var(--ink)`、浅色段不得再给状态芯片补字色、`margintop` 这类拼写错误。
+- 新增 **H 段「状态徽标族」**：把 生成中 / 排队 / 已取消 / 失败 / 已完成 五种角标和芯片做成固定样本注入页面（现场不一定有这些状态，也不能为看颜色去发一个耗积分的任务），逐个实测**有效底色色相 + 文字对比度**，浅色列断言「不暖、不是深底」，深色列反向断言「琥珀仍在」，量完即删。
+- 新增 **I 段「上游报错文案」**：6 个 `errBrief` 用例（响应体 JSON / `error.message` / 普通文字 / 残缺 JSON 不抛异常 / 超长截断 / 空值退回兜底文案）。
+
+回归：`verify-round22 / 29 / 32 / 40 / 42` 全绿；`verify-round17d-studio.js` 仍是那条已知的过期数据断言（时长档位）。
+
+
+## 第四十八轮优化(需求三十一续 · 网格排满整行 + 分页条不再压在卡片上)
+
+需求：「1、优化页面中的 UI/UX，可以做适当调整，能够方便使用；2、资产库中的图片没有塞满，会空几个位置」。
+
+### 先量测(1750px 视口，20 项资产)
+
+| 现象 | 实测 | 结论 |
+| --- | --- | --- |
+| 资产网格「空几个位置」 | 行内卡片 `hSpan:0 / thumbSpan:0`，行距 `dead:13` | 卡片本身没问题 —— 空格是**末页行数不整**:20 项 ÷ 6 列 = 6/6/6/**2**，最后一行缺 4 格 |
+| 分页条 | `position:sticky` + `bottom`，`overlapsScroller:6` | 吸底时分页条**横压在最底一行 6 张卡片上**,点击区被遮 |
+
+根因:分页大小一直是后端约定的常量 `PAGE_SIZE = 20`,与网格实际列数无关;而列数是 `repeat(auto-fill, minmax(220px,1fr))` 算出来的,随窗口宽度 3~8 列变化。**每页条数是定值、每行列数是变值**,两者永远对不齐,末行必然残缺;`sticky` 分页条则是为了让「翻页控件常驻可见」而付出的遮挡代价。
+
+### 改法
+
+1. **每页条数随列数自适应**：`ui.js` 新增 `gridCols(el, minVar)`(用与 CSS 完全相同的 `floor((w + gap) / (min + gap))` 公式实测列数)和 `gridPageSize(el, minVar, fallback)` = `列数 × PAGE_ROWS(4)`。列数 < 2(测量不到 / 极窄)时回落到后端默认 `PAGE_SIZE`,不会出现每页 1 条这种荒唐值。
+2. **最小卡宽令牌化**：`220px` / `244px` 这两个硬编码值提为 `--card-min`、`--ig-card-min`,CSS 的 `minmax()` 与 JS 的列数计算读同一枚令牌——浅色模式下圆角/间距变大,卡宽下限也一并跟着调,JS 不会按旧值误算列数。
+3. **先渲染骨架、再量列数**：`assets.js` 的 `render()` 改成先 `renderUI()` 出空网格(`_loading` 守卫挡住两个 `render*()`),这样 `#assetGrid` 已经进布局树、能拿到真实 `clientWidth`,再据此定 `state.size` 去 `load()`。所有分页算术从 `PAGE_SIZE` 改读 `st.size / this.state.size`。生图记录侧同理,`renderResults()` 量出 `st.rsize`。
+4. **分页条改成栏底固定**：`.ast-main` 变成 `flex-direction:column; overflow:hidden`,滚动区单独包一层 `.ast-scroll`,`#astPager` 作为 `.ast-pager` 挂在它**外面**——不再 `sticky`、不再有 `box-shadow` 浮起,只靠一条 `border-top` 与内容区分隔,`flex-shrink:0` 保证永不被压缩。生图记录的 `#igResPager.ig-res-foot` 同理移出 `.ig-res-scroll`。
+5. **`.pager` 的 `sticky` 规则保留**：资产库/创作台里的**弹窗选图器**仍然是一整块滚动区,那里吸底是合理的(选完就关,不存在长期遮挡)。用 `body:not(.page-fill) .ast-pager` 让非满高布局下的分页条维持原来的独立卡片外观,两种语境各自成立。
+6. **窄屏/矮屏兜底**：`≤1080px` 与 `≤620px` 两段媒体查询里补上 `.ast-scroll`,在窗口高度不足时退回「整页滚动 + 分页条走普通文档流」,避免 `.ast-main` 被压成几十像素高。
+
+效果：1750px 下资产库变成 **6 列 × 4 行 = 每页 24 张,末行不缺格**;分页条 `position:static`,`overlapsScroller:0`。生图记录 4 列 → 每页 16 张,底栏显示「共 41 条 · 每页 16 条」。
+
+### 顺手的使用流小改
+
+- 新建文件夹从「弹窗关掉再等业务」改成 `formModal({ onSubmit })` 契约:失败留窗、按钮恢复,不再静默。
+- 空资产库文案补明确动作指引(「点右上『上传资产』添加…」),不再是孤零零一句「暂无资产」。
+
+### 验证
+
+`test/verify-round44-light-menu.js` 由 263 项扩到 **267 项全过**，新增「每页排满整数行」段：分别量资产库与生图记录,断言「末页行数 × 列数 == 每页条数」且「非末行无缺格」；再加「分页条不压在卡片区上」(几何相交测试,不是读 CSS 声明)。这两条正是本轮改前的量测脚本,留下防回潮。
+
+回归：`verify-round22.js`、`verify-round29-uiux.js`、`verify-round32-srcref-tasks.js`、`verify-round40-modelcfg.js`(28 项)、`verify-round42-text.js`(67 项)全绿；`verify-round17d-studio.js` 仍是那条已知的过期断言(「时长档位 13 档」—— 第三十七轮接入大模型后档位已变,与本轮无关)。
+
+
+## 第四十七轮优化(需求三十一续 · 卡片网格等高 + 生图成果卡重排)
+
+需求：「1、页面中的 UI/UX 可以做适当调整，能够方便使用；2、AI 生图记录显示不美观，不止这个页面出现了这种情况」。
+
+### 先量测，再动手(无头 Chrome 逐行量网格)
+
+| 网格 | 行内卡片总高差 | 行内媒体块高度差 | 结论 |
+| --- | --- | --- | --- |
+| `.ig-res-grid` 生图成果 | 0(grid 拉伸) | **0 / 51 / 11 / 109px** | 总高被拉平,差值全被文字区吸收 → 短图卡片底部一大片死白 |
+| `#assetGrid` 资产 | 0 | 0 | 本来就等高 |
+| `#projGrid` 项目 | 0 | 0 | 正常 |
+
+根因链：第三十三轮为了让用户看出「换了画幅比例」，把 `.ig-img-cell` 改成按图片真实宽高比撑高(`aspect-ratio: w / h`)—— 于是 16:9 的卡片媒体块 98px、1:1 的 218px，同一行差 109px。叠加另外两处：`.ig-card-meta` 是一整串 `#id · 模型 · 比例 · 分辨率 · 尺寸 · 时间` 且**没有裁切**(实测 2–3 行)、`.ig-card-foot` 里「状态徽章 + 三枚带字按钮」在 244px 卡宽下必然折成两行(量得 269px > 可用 220px)。
+
+### 改法
+
+1. **媒体块定高**：新增 `--media-h: 180px`，`.ig-card-media` 统一框高、缩略图 `object-fit: cover`;比例信息不再靠形状暗示,而由参数行(`16:9 · 2K · 1536×1024`)与多图角标(`4 张`)说明。进度块 / 失败块同样吃满这个框,不再随文案长短抖。
+2. **状态徽章上封面、页脚只留动作**：`.ig-card-flag` 压在封面左上角(与资产库的类型角标同一语言),页脚腾出来放「下载 / 再次生成 / 删除」—— 一行放得下,不再折行。
+3. **角标必须实底**：列表里那套「语义色文字 + 12% 半透明底」放到照片上完全读不出来,`.ig-card-flag .status-*` 改成实底语义色 + `--ok-ink/--warn-ink/--danger-ink` 字色(排队/取消走 `--scrim-rgb` 深底白字)。
+4. **已完成不贴角标**：一屏六枚同款绿章是纯噪声,只有 进行中 / 排队 / 失败 才显示状态徽章。
+5. **文字定行**：提示词 2 行(原有)、模型名 1 行、参数+时间 1 行(超出省略并把完整内容放进 `title`);时间口径统一成相对时间 `fmtAgo`(与资产库一致),任务 ID 移出可见文本、留在 tooltip 里。
+6. **同类问题一起扫**：`#styleGrid .card` 补 `display:flex; flex-direction:column`(原先 `> div:last-child { margin-top:auto }` 因为父级不是 flex 而**一直是空转的**),标签行改单行不折;新增 `.clamp-1 / .clamp-2` 工具类。
+7. **表面上的勾选框不再伪装成图片浮层**：`.style-check / .proj-check` 是勾在白卡表面上的,原先继承 `.asset-check` 的深底浮层配方 —— 浅色下是一个突兀的黑块、深色下几乎看不见。改走 `rgba(var(--film), .07) + --line-strong`,并把浅色那条强制白字/白边的规则收窄到 `.media-card .asset-check`(真的压在缩略图上的那种),同时补回 `.on` 的字色。
+
+### 验证
+
+`test/verify-round44-light-menu.js` 由 255 项扩到 **263 项全过**，新增「卡片网格等高」段：在 深浅 × 4 个网格(成果 / 资产 / 风格 / 项目)逐行实测 `卡片总高差 / 媒体块高差 / 底边差`，任一项 > 2px 即失败 —— 这一条正是本轮改前的量测脚本，留在套件里防止「按真实比例撑高」这类改动回潮。
+
+回归：`verify-round22.js`、`verify-round29-uiux.js`、`verify-round32-srcref-tasks.js` 全绿。
+
+
+
+## 第四十六轮优化(需求三十一 · 全站元素统一 + 消除「保存失败却像成功了」)
+
+需求：「优化全站的页面UI/UX，使操作和样式更优秀；当前页面中有些元素不统一」。先做两路并行盘点(CSS 令牌/族漂移、JS 视图交互与文案)，再按「看得见的统一优先」动手。
+
+### 量测出来的不统一(改前)
+
+| 族 | 现状 | 漂移值 |
+| --- | --- | --- |
+| 圆角 | 39 处硬编 `6px` / `13 处 7px` 游离在 `--r-sm/md/lg` 之外 | `.ig-ref-chip`(r-sm) 包着 `.ig-ref-thumb`(6px) → 浅色下同一枚芯片内外两种圆角 |
+| 微间距 | `gap: 5px` ×29、`6px` ×32、`7px` ×15 —— 一个从未声明的 5–7px 档 | 与「间距 4 的倍数」的自述契约直接冲突 |
+| 芯片 | `.cat-chip` 30 / `.pg-btn` 28 / `.em-size-tag` 28 / `.ig-cap-chip` 22 / `.cost-hint` 28，圆角一半胶囊一半 `--r-sm` | 同一行里两种形状 |
+| 徽标 | `.tag` 无 `font-weight`、`.status` `3px 10px`、`.free-badge`/`.tag-api` 6px 方角、`.tm-active-tag` `1px 8px`+5px | 表格里一排「看起来同类、数值各不同」的标签 |
+| 计数药丸 | `.ws-ref-count` 22×20、`.ws-left-open-count` 24×18、`.cc-pending` 18×18 | 同角色三种尺寸 |
+| 选中态 | 强选中(`--gold-fill` 实底)与弱选中(`--surface-hover`)混用无规则；`.wb-tbtn.on` 竟是**红色危险** | 浅色下满屏深色实底；`.on` 一个后缀两种语义 |
+| 聚焦 | 4 处 `rgba(227,180,94,.14)` 光环 + 1 处 `.12` + 2 处只改描边 + 4 个输入框完全没有环 | 键盘用户无一致反馈 |
+| 浮层 | `rgba(7,6,4,·)` ×8、`rgba(10,8,5,·)` ×5、浅色 `rgba(18,32,48,.6)` —— 三套配方，且浅色把所有浓度压成同一个 .6 | 深浅两主题的层级关系不一致 |
+| 死代码 | `.ig-form .field` 被后写规则整条覆盖(紧凑化从未生效)、`.ig-foot-row .ig-go` 重复两遍、`.table .muted/.num` 与工具类重复、`--pl-name-fs` 被消费却从未声明、`.pl-token.ok .pl-tname` 硬编 `#f4d9a2` 逼出一条浅色覆盖 | 「组件不硬编码」的契约被自己违反 |
+| 交互 | 11 个弹窗把 API 调用写在 `formModal()` **之后** → 请求失败时弹窗已关闭，用户以为保存成功(剧本 / 新建项目 / 编辑项目 / 分集 / 文件夹 / 配额 / 积分 全中招)；重置邀请码无确认；收藏切换无 try/catch 无禁用；分镜 0 镜时中间是一整块空白 | 「点了没反应」与「数据静默丢失」 |
+| 文案 | 资产 128 / 素材 30 / 资源 12 —— 页面叫「资产库」、按钮叫「上传素材」、弹窗叫「补给资产」、搜索框叫「搜索素材名称」 | 同一对象三个名字 |
+
+### 改法
+
+1. **阶梯补齐**：新增 `--r-xs(6) / --h-2xs(22) / --h-xs(28) / --sq-sm(26) / --sq-md(30) / --gap-xs(6)`，把 52 处圆角、76 处微间距、10+ 处控件尺寸收编进去；芯片族统一胶囊形(`.pg-btn`/`.em-size-tag`/`.cost-hint` 由 `--r-sm` → `--r-full`)，徽标族统一 `11px / 700 / 2px·8px / 胶囊`，计数药丸统一 `--h-2xs`，方形图标按钮统一 `--sq-sm/--sq-md` + `--r-sm`。
+2. **选中态分两级并全部令牌化**：`--sel-fill/--sel-ink/--sel-line`(强：芯片「就是这一个」) 与 `--sel-soft/--sel-soft-ink/--sel-soft-line`(弱：导航 / 工具条 / 目录树 / 命令面板 / 尺寸标签)。深色下强=鎏金实底、弱=悬停雾(取值与原先逐字相同 → **深色零变化**)，浅色下两级收敛成同一种淡蓝。卡片选中另给 `--sel-ring`，收掉 5 处硬编 `box-shadow: 0 0 0 1px var(--gold)`。删掉语义冲突的死规则 `.wb-tbtn.on`。
+3. **聚焦环唯一配方 `--ring`**：6 处引用，`.ws-neg` / `.wb-ai-inner` 补上原本缺失的环。
+4. **浮层三件套 `--scrim-rgb / --scrim-ink / --scrim-line`**：13 处暖黑配方统一，各组件保留自己的浓度，浅色只翻底色与字/边 —— 段 29 里那条把 .72/.78/.8 全压成 .6 的规则随之删除。
+5. **死代码清理**：删被覆盖的 `.ig-form .field`、重复的 `.ig-foot-row .ig-go`、冗余的 `.table .muted`/`.table .num`；声明 `--pl-name-fs`；`#f4d9a2` → `var(--gold-soft)`。
+6. **交互**：11 个弹窗的写操作全部移进 `formModal({ onSubmit })` —— 失败时弹窗保持打开、按钮恢复可用、已输入内容不丢(此前是「弹窗关闭 + 全局 toast 一闪 + 数据没了」)；后台三个「保存」按钮统一走新增的 `saveWithBusy()`(禁用 + 「保存中…」+ 失败弹错)；重置邀请码加不可撤销确认与禁用锁；收藏切换加 try/catch + 禁用防连点；分镜工作台 0 镜时给出带下一步指引的空态。
+7. **文案统一**：用户可见的「素材」全部改口「资产」(上传资产 / 搜索资产名称 / 项资产 / 补给资产 tooltip)，「添加模型」→「新建模型」与 新建项目/分集/风格 同一动词；toast 文案去掉与 `toast()` 自带图标重复的 ✅/❌，提示里的 `⚠` 字符换成 lucide `triangle-alert`。
+
+### 事故与恢复(如实记录)
+
+第 4 步的一次 codemod 把「成对替换」写成了扁平数组，`for (const [a,b] of [...])` 于是按**字符**解构，实际执行了 `b→o`、`g→a`、`r→g`、`c→o` 四次全文替换，`section 29` 之前的 2035 行全部损坏。恢复方式：从 `git show HEAD` 取回段 1–28，按本轮记录**重放**第四十四/四十五/四十六轮的全部 codemod(逐条断言命中次数)，再接回未受损的段 29；随后跑当时已有的 232 项断言套件验证 —— **全过**，证明重建与损坏前一致。教训已写进脚本约定：替换函数必须接收 `[from, to]` 数组并断言命中数。
+
+### 验证
+
+`test/verify-round44-light-menu.js` 由 232 项扩到 **255 项全过**，新增：
+
+- **A 段静态契约**：圆角/微间距/浮层底色不得再出现字面值、`--ring` 至少 6 处且无残留 `box-shadow: 0 0 0 3px rgba(`、强弱选中各 6/4 处确实引用对应令牌、`--sel-ring` 5 处、`.wb-tbtn.on` 已消失、徽标族带 `font-weight: 700`、重复选择器各只剩一处、`--pl-name-fs` 已声明、十个新阶梯令牌齐备。
+- **G 段运行时族几何**：在 5 个页面上实测每个族成员的 `height / border-radius / font-size / font-weight / padding`，断言「同族圆角只有一个值」「控件族高度全部落在 22/26/28/30/36/44 阶梯上」「徽标族字号 11px、字重 700、内边距一致」—— 把「统一」变成可回归的数字，而不是目测。
+
+回归：`verify-round22.js`、`verify-round29-uiux.js`、`verify-round32-srcref-tasks.js`、`verify-round40-modelcfg.js`(28)、`verify-round42-text.js`(67) 全绿；`verify-round17d-studio.js` 仍只有那条数据性过期断言失败。
+
+### 本轮明确没做(避免半吊子)
+
+- 三处手写的上传弹窗(assets / 补给资产 / 资产选择器)合并成一个 `uploadDialog()`，以及分镜工作台里整份复刻的 AI 生图面板改为复用 `ImagesView` —— 两处都是 ~200 行的抽取，值得单独一轮。
+- 筛选/分页/滚动位置在刷新后的持久化(目前只有主题与文本模型进 localStorage)。
+
+
+
+## 第四十五轮优化(需求三十 · 浅色模式换族「青白 · 疏朗」)
+
+需求：「优化浅色模式页面样式，更清新大气，不要原来的黄色主题」。上一轮的浅色只是把鎏金压暗成 `#a8823c` 系，色族没换，所以整体仍是一张黄纸。
+
+**第一版只换了色(黛蓝 #2f6089)，反馈是「还不够清新大气」。** 复查截图才看清问题不在色相：画布 `#fbfcfe` 与卡片 `#ffffff` 几乎同色 → 整页没有层次；到处是 1px 发丝线 → 像表格不像版面；选中芯片、分页当前页、上下文标签页全是一排深色实底 → 闷；页头标题 17px、表格行 11px、卡片间距 16px → 挤。**「清新大气」是空间与层级问题，换色只解决了一半。** 第二版因此重定为「青白 · 疏朗」。
+
+### 令牌(全部只写在 `section 29`，组件规则一行未改)
+
+| 令牌 | 深色(不变) | 浅色 | 说明 |
+| --- | --- | --- | --- |
+| `--bg` / `--surface` | `#0b0a08` / `#14110d` | `#f4f8fc` 冷雾 / `#ffffff` | **画布与卡片差出一档，卡片才浮得起来** |
+| `--line` / `--line-strong` | `rgba(217,189,130,.14/.30)` | `rgba(23,43,66,.09/.18)` | 描边退到几乎看不见，分层交给影子 |
+| `--card-shadow` | `none` | `0 1px 2px …, 0 10px 24px rgba(23,43,66,.07)` | 新增令牌：统计卡 / 媒体卡的浮起 |
+| `--gold` / `--gold-fill` | `#e3b45e` / `#f5d07e` | `#2a76ba`(青蓝，比靛蓝更亮更透) | 白字 4.8:1 |
+| `--gold-text` / `--info` | `#e3b45e` / `#7aa7d9` | `#1d5c93` / `#1d5c93` | 强调字与小标签走深一档，11px 也过 AA |
+| `--gold-ink` | `#191307` | `#ffffff` | 色块上的字 |
+| `--sel-fill / --sel-ink / --sel-line` | `var(--gold-fill) / var(--gold-ink) / transparent` | `#e7f2fb / #1a5588 / #c2dcf2` | **新增令牌：选中态与主行动分离** —— 实心只留给唯一的主行动按钮，芯片/分页/上下文标签一律淡蓝底 |
+| `--gap / --gap-sm` | `16px / 12px` | `20px / 16px` | 网格留白 |
+| `--pad-card / --pad-card-sm` | `20px / 16px 20px` | `24px / 16px 22px` | 卡内白 |
+| `--row-py / --head-py` | `11px / 10px` | `14px / 12px` | 表格行高 |
+| `--pad-page` | `24px` | `32px` | 页头上方留白 |
+| `--fs-page-title` | `17px` | `22px` | 页头标题层级 |
+| `--r-sm / --r-md / --r-lg` | `8 / 12 / 16` | `9 / 14 / 20` | 圆角更柔 |
+| `--ok / --warn / --danger` | 定位绿 / 琥珀 / 朱红 | `#177a52 / #a85a12 / #c53a32` | 语义不动 |
+
+### 做法
+
+1. **色族**：新增 `--accent-rgb / --accent-hi-rgb / --accent-deep-rgb` 三组 RGB 三元组令牌，把 26 处硬写的品牌金(`.avatar`、`.dash-hero .dh-avatar`、`.brand-logo`、`.topbar::before`、`.tag-cat`、`.select-box`、`.toast::after`、6 处输入框聚焦光环、`.pl-token.ok/.no`、`.pl-hint-name:hover` …)改写成 `rgba(var(--accent-rgb), a)` —— 浓度逐条保留，深色像素不变，浅色整族翻青蓝。这是上一轮 `--film` 的同一手法。
+2. **空间与层级**：新增 `--gap / --gap-sm / --pad-card / --pad-card-sm / --row-py / --head-py / --pad-page / --fs-page-title / --card-shadow / --sel-*` 十个令牌，取值在深色里全部等于原值(`--gap: var(--sp-4)`、`--card-shadow: none`、`--sel-fill: var(--gold-fill)`…) —— 组件规则改成引用它们，于是浅色放宽留白、卡片浮起、选中态转淡，**深色一个像素都没变**。
+3. 修掉一处 JS 内联白雾：后台用户表「用户」角色标签写死 `background:rgba(255,255,255,.06)`，浅色下等于没有底色 → `rgba(var(--film), .06)`。
+4. 浅色段自带的暖色字面值全部重写：氛围径向光、光球、顶栏发丝线、`::selection`、滚动条、`.auth-poster`、`.brand-name/.auth-title/.cmdk-mark` 渐变字、`.pl-token.ok`(青蓝实底 + 白字，语义仍是「已链接」)、图片浮层与遮罩的墨色基座(`31,35,41` → `18,32,48`)、缩略图占位灰；`body::after` 颗粒 .02 → .012(浅底上不该有噪点)。
+
+### 验证
+
+`test/verify-round44-light-menu.js` 由 199 项扩到 **232 项全过**：
+
+- **静态 · 色**：浅色品牌令牌必须 b 通道 > r、`--gold-ink` 浅色下是白字、浅色段禁止出现旧鎏金字面值、≥18 处品牌色雾走 `--accent*-rgb`、深色 `--gold:#e3b45e` 与 `--accent-rgb:227,180,94` 仍在(证明两套互不影响)。
+- **静态 · 空间**(本轮新增，防的就是「只换色」)：浅色画布与卡片的相对亮度必须差 ≥.02、`--card-shadow` 浅色非 none 而深色必须是 none、`--gap/--pad-card/--row-py/--pad-page/--fs-page-title` 五项浅色必须逐项大于深色解析后的实际值、`--sel-fill` 浅色必须是高亮度淡底且 `--sel-ink` 在其上 ≥4.5:1、`.cat-chip.on/.pg-btn.on/.ctx-tab.active` 确实引用了 `--sel-*`、浅色描边透明度必须比深色更淡。
+- **运行时**：12 个页面 × 浅色的每个可见元素，`color / background / border / outline` 命中旧金色清单(22 个字面值)即失败 —— 这是「不要黄色主题」的可执行定义；琥珀/朱红是语义色按值放行。另加 **F 段登录页**(清 cookie 后量测未登录外壳，此前 `#authRoot` 不在覆盖范围内)。
+
+回归：`verify-round22.js`、`verify-round29-uiux.js`、`verify-round40-modelcfg.js`(28 项)、`verify-round42-text.js`(67 项)全绿；`verify-round17d-studio.js` 仍只有那条数据性过期断言(时长档位 13 档)失败。
+
+
+
+## 第四十四轮优化(需求二十九 · 浅色模式全站适配 + 资产库「更多」面板被覆盖)
+
+需求：「1、完善浅色模式页面适配，当前有些页面没有完全适配；2、资产库的『更多』面板被覆盖」。
+
+### 改前实测(无头 Chrome · 12 个页面状态 × 深浅两套主题)
+
+| 现象 | 根因 |
+| --- | --- |
+| 资产库「更多」菜单第 3 项「新建文件夹」点不到，`elementFromPoint` 命中的是底下的卡片 | `.content > *:first-child` 的入场动画用了 `animation-fill-mode: both`，动画结束后 `.page-head` 上永久留着 `transform: matrix(1,0,0,1,0,0)` —— **任何非 none 的 transform 都会造出一个层叠上下文**，于是面板的 `z-index:120` 只能在页头内部生效，压不到后面按文档顺序绘制的卡片 |
+| 浅色下「开始生图 / 新建项目 / 上传素材 / 添加模型 / 保存设置」全部退化成一行黑字(用户截图指的就是这个) | 浅色段用 `html[data-scheme="light"] .btn{background:#fff}` 整条覆盖按钮，「属性+类」权重 (0,2,1) 高于组件自己的 `.btn-primary`(0,1,0)，金色填充与 `border-color:transparent` 一起被压成白底白边 |
+| 浅色下看不出哪个分类芯片是选中的、勾选中的方框仍是深灰 | 同一类权重陷阱：`.cat-chip` 压过 `.cat-chip.on`、`.em-size-tag` 压过 `.em-size-tag.on`、`.wb-tbtn` 压过 `.wb-tbtn.active`、图片浮层组的 `.asset-check` 压过 `.asset-check.on` |
+| 顶栏头像、生成记录计数、参考资产计数、运动强度数值、追加新分镜…金字 3.2~3.6:1 | 这些规则写的是装饰金 `var(--gold)`(浅色 #a8823c)，而设计系统规定小号金字要用 `--gold-text`(#8a6a2c，5.05:1) |
+| 存储条 / 任务进度条 / 生图卡片进度轨在浅色下「不存在」 | 轨道底色硬写 `rgba(255,255,255,.07)` —— 白雾压在白卡上等于透明 |
+| 主题管理页色板里深色样本与白底糊在一起；通知计数白字压亮红 3.46:1 | 缺少描边 / 缺少「印在语义色块上的字色」令牌 |
+| 浅色下**每张项目卡都像是已勾选**(左上角方框里始终有个白对勾) | 图片浮层那条 `… .asset-check { … color: #ffffff }` 把勾选框用来藏对勾的 `color: transparent` 覆盖掉了 |
+| 右击菜单会跟着路由飘到下一个页面 | `.ctx-menu` 挂在 `body` 上，只靠「下一次点击」自毁，而前进/后退、⌘K 跳转都没有点击 |
+
+### 改法
+
+1. **层叠上下文**：入场动画改 `backwards`(有延迟的元素本来就用 backwards)，并给 `.page-head` 补 `position:relative; z-index:30` 兜底 —— 页头里的下拉面板从此永远压在内容栏(卡片网格 / 各自滚动的分栏)之上。
+2. **浅色模式改成「只换令牌，不换组件」**：新增 `--film`(薄雾底色：深=白雾 / 浅=墨雾)并把 37 处 `rgba(255,255,255,.0x)` 底纹改写成 `rgba(var(--film), .0x)` —— 每条规则保留自己原本的浓度，深色模式像素不变，浅色模式自动翻成看得见的墨雾。据此删掉浅色段 4 组权重压人的整条覆盖(`.btn`、`.cat-chip/.ig-cap-chip`、15 个 `.icon-btn/.wb-tbtn/…`、`.input/.select/.textarea`)，填充与选中态交还组件自己；浅色段只留两类必要覆盖(压在图片上的浮层、语义色浓度补偿)。
+   - 顺手修掉一条**从未生效**的选择器 `html[data-scheme=light] html[data-scheme=light] .dash-new-card`(自嵌套)。
+   - 新增 `--ok-ink / --warn-ink / --danger-ink`：语义色块上的字色(浅色下翻白字)，通知计数由 3.46:1 → 5.0:1。
+   - 勾选/选中态在浅色下补回鎏金：`.asset-check.on`、`.wb-check.on`、`.ig-pick-item.sel .ig-pick-check`；并把浮层组的白字限定在**标签类**浮层上，勾选框的 `color: transparent` 交还组件。
+3. **金字走 `--gold-text`**：29 条小号金色文字规则(`.avatar`、`.ws-ref-count`、`.ig-res-title b`、`.ws-param > label b`、`.pl-chip`、`.ws-add-shot`、`.wb-script-btn`、`.ws-recs-run` …)。深色下 `--gold-text == --gold`，视觉零变化。
+4. **浅色层级与底色微调**：`--ink-3` #6c7482 → #636b79(分页/次要文字在 `--surface-2` 上由 4.4:1 提到 4.88:1)，`--elev-2/--elev-3` 改双层阴影(紧影+散影，白面板压白页面才分得开)，弹窗遮罩 .30→.34，主题色板小圆点加 1px 描边。
+5. **路由切换收掉右击菜单**：`App.route()` 里清 `.ctx-menu`。
+
+### 验证
+
+新增 `test/verify-round44-light-menu.js`：**199 项全过**，五段 ——
+A 静态契约(`--film` 存在且浅色翻转、组件底纹不再出现白雾字面量、浅色段不得再整条覆盖 `.btn/.cat-chip/.icon-btn/.wb-tbtn/.em-size-tag/.input/.select/.textarea`、浮层组不得给勾选框强设白字、无自嵌套失效选择器、`.page-head` 有 z-index、入场动画不用 `both`)；
+B 运行时量测 × 深浅 × 12 页面(文字对比度 AA、控件与所在表面同色、被别的内容盖住的可见控件、文字裁切、文档横向溢出、深色残留 —— ≥20px 才算「表面」，品牌/语义填充按令牌值白名单放行)；
+C 三个「更多」下拉 + 右击菜单的每一项中心点必须命中面板自身(深浅各测)；
+D `.page-head` 动画结束后 `transform` 必须为 `none`、浅色主按钮实心且比次按钮醒目、选中芯片/当前页/勾选框与未选中可分辨、未勾选的对勾仍然隐藏、切路由后 `.ctx-menu` 不残留；
+E 窄屏 980×620 与矮屏 1440×560 回退整页滚动后，「更多」面板依然完整可点。
+
+回归：`verify-round17d-studio.js`(仅 1 项数据性过期断言「时长档位 13 档」，第三十九轮已记录)、`verify-round22.js`、`verify-round29-uiux.js`、`verify-round32-srcref-tasks.js`、`verify-round40-modelcfg.js`、`verify-round42-text.js`(67 项)全绿；`verify-round23.js` 2 项、`verify-round28-fixes.js` 2 项仍是既有的故意过期断言(字面色值 `#d4af6e`、第三十三轮前的「短边 × 1.5」换算)。
+
+
+
+## 第四十三轮修复(刷新不再跳回第一个标签 · 后台子标签进地址栏)
+
+现象(用户报)：「刷新时都会跳到第一个页面；在任务监控刷新，刷新成功会跳到模型设置」。
+
+实测定位：顶层路由是好的 —— 在 `#/images`、`#/assets` 刷新仍停在原页；**只有后台管理的子标签会丢**，因为它只存在 `AdminView.state.tab` 里，地址栏始终是 `#/admin`，刷新后按初始值渲染成第一个标签(模型管理)。
+
+修复：
+
+1. 子标签写进地址：`#/admin/tasks`、`#/admin/settings` …… `app.js` 的路由把第二段作为 `params.tab` 传给 `AdminView.render`；不在 `ADMIN_TABS` 白名单里的值回落「模型管理」(不白屏)。
+2. 点标签改为写 `location.hash` 而不是直接调 `switchTab` —— 于是**刷新停在原标签、浏览器后退能在标签之间回退**，地址还可分享。
+3. 顺带修顶部导航高亮：原来 `path === r` 的精确匹配会让 `#/admin/tasks` 这类子路径**丢掉「后台管理」的高亮**(`/projects/xx` 早有特例，admin 漏了)。
+4. 同轮补：任务监控里文本任务原先整列显示「—」，现按 `润色剧本 · 91→287 字 · 1s`、`拆分镜 · 118→900 字 · 13 镜` 渲染。
+
+验证：`verify-round42-text.js` 由 60 项加到 **67 项全过**，新增 7 项地址栏用例(直达 `#/admin/tasks` 打开的就是任务监控且有数据行、子路径下顶部导航仍高亮、点标签写入地址、**刷新后停在原标签**、后退回到上一个标签、未知子标签回落不白屏、文本任务参数行可读)。回归 `verify-round29-uiux.js`、`verify-round22.js` 全绿。
+
+已知无关失败：`test/qa-round17b-nav.js` 报 `Cannot read properties of null (reading 'scrollWidth')` —— 它是初版提交里的量测脚本，量的是 `.ws-nav` / `.ws-crumb`，而 v4 改版已明确取消 `ws-nav`(见 `public/js/views/projects.js` 注释)，属陈旧探针，与本轮无关。
+
+
+## 第四十二轮优化(接入文本模型 · 剧本与文字处理)
+
+需求:「添加常用文本处理模型(gpt、claude、deepseek…)，能够处理剧本和文字」。
+
+### 现状盘点(全部免费查得)
+
+平台此前**没有任何文本模型代码**(`chat/completions` 全库零命中)，剧本字段是 `shots.script`(分镜级)与 `episodes.script`(分集级)。手上 Key 能出的文本模型:
+
+| 来源 | 可用文本模型 | 备注 |
+|---|---|---|
+| Agnes(两把 Key) | `agnes-3.0-flash`、`agnes-2.5-flash/pro/pro-alpha/pro-beta` | `.cn` 端点实测 2.3s 返回；`apihub` 那把 Key 对 chat 返回 401(两把 Key 不通用) |
+| 智谱 | 11 个 GLM(`glm-4.5` … `glm-5.3-flash/flashx`) | Flash 档免费，本轮未接入 |
+| 百炼 | 180 个模型，含 `deepseek-v4-flash/pro`、`kimi-k3`、`qwen3.8-max/flash` | 有免费额度，本轮未接入 |
+| 中转站 ys666 | **无 chat 模型**(只列媒体) | gpt/claude 走不通这家 |
+
+### 接入的模型(3 个，均实测通过)
+
+| 模型 | id | 计费 |
+|---|---|---|
+| `Agnes 3.0 Flash 文本（免费）` | `m-1e470555e38fb184` | `is_free=1`，0 积分 |
+| `中转站 GPT-6.1 Sol 文本` | `m-8c9b3be73e9fe338` | 1 积分/次 |
+| `中转站 DeepSeek V4 Flash 文本` | `m-278e574f3c8e41f8` | 1 积分/次 |
+
+默认文本模型 = 免费那个(系统设置可改)。**⚠ 提醒**:后两个会把剧本文本发到站外第三方域名(其中一家的真实域名是 punycode 编码的中文域名)，且 API Key 已出现在会话记录里 —— 建议用轮换就轮换，敏感剧本别走第三方通道。
+
+### 实现
+
+1. `models.type` 新增 `text-generation`。此前 `POST/PATCH /api/admin/models` 会把未知类型**强转成 `image-to-video`**，`normalizeRulesInput` 的协议白名单也不认 `openai-chat` —— 两处都补上；模型有效性检查同步放行。
+2. 新增 [server/textgen.js](server/textgen.js)：`openai-chat` 适配器(`rules.create.path/body/timeout_ms/headers` + `response.content_path` 可配，延续「不写死网关」)与 **5 个内置任务模板**：润色剧本 / 扩写细节 / 压缩精简 / 转成视频提示词 / 拆成分镜。**system 提示词只在服务端**，前端只能传 `task` 枚举 + 待处理文本 —— 这个端点不是通用 LLM 代理。
+3. 新增 [server/api/text.js](server/api/text.js)：`GET /api/text/models`(模型 + 任务枚举 + 单价)、`POST /api/text/complete`。按次计费(新设置 `creditPerText`，免费模型恒 0)，每次调用落一条 `tasks`(`type='text-generation'`，`params` 记 `chars_in/chars_out/usage/ms`)让后台任务监控看得到失败原因，**失败自动退分**；字数上限按模型 `rules.limits.max_chars`(默认 2 万)。
+4. 拆分镜的 JSON 容错(实测模型会加 ```json 围栏、把 duration 写成字符串、混入无文案项)：剥围栏 → 截首个 `[...]` → 逐条校验 → `duration` 转数字并夹到 1–60 → 丢弃空文案 → 全空则报可读错误。
+5. 前端**复用既有入口，不新增常驻占位**：分镜「剧本文案」标题行右侧一个 `✨ AI 改写` 按钮 → 菜单四项(带计价标注)+「撤销上一次 AI 改写」+ **底部直接列全部文本模型可一键切换**(当前项打勾并禁用，选择记在 localStorage，只影响本机、不改别人的默认)；工具栏 `✂ AI 拆分镜` 按本集原文批量追加分镜(**只追加、绝不覆盖已有分镜**)；系统设置加「文本处理单价」与「默认文本处理模型」。
+
+### 顺带修掉的五个真问题
+
+- `server/db.js` 的「空参数模板补标准参数」迁移会把文本模型的空 schema 填成**视频参数(时长/帧率/运动/种子)**——已排除 `text-generation`，并还原被写坏的 3 行。
+- `/api/styles/models` 对文本模型走的是**视频适配器**探测，后台把 `openai-chat` 标成「Agnes Flash 适配」——按类型分流到 `textgen.detectProtocol`。
+- `✨ AI 改写` 按钮被卡片右缘裁字(`.ws-icon-btn` 固定 26px 见方)——放开宽度并让提示文字可截断。
+- 后台「检查 / 自检」没跟着文本模型走：`runModelCheck` 的协议白名单只有视频/生图，于是文本模型一律报 **`生成规则协议未知: openai-chat`**；探活又固定按视频协议打 `/videos`（实测消息里出现「创建路径 /videos 探活通过」）。现在按类型分流：文本模型校验 `openai-chat`、探活打 `/chat/completions`(无效模型名，不建单不计费)。
+- 文本模型点「端到端自检」原先会掉进**视频**自检分支(造测试源图 + 提交 image-to-video 任务)。现改为真发一次极短 chat 请求并落 `tasks`(带 token 用量)，超时上限 45s 快速失败；免费文本模型自检 0 积分。
+- `PATCH /api/admin/settings` 对 allowed 清单里的**所有**字段统一做 `Number()` 转换，于是字符串型的 `defaultTextModel` 被转成 `NaN → null`，「默认文本模型」选了也存不住(实测该键落库为 `null`，界面永远显示「自动」)。现按字段分流：`gpuPool`/`defaultTextModel` 走字符串，其余走数字，且设置的 id 必须是**已启用的文本模型**，否则 400。
+
+### 验证
+
+- 新增 `test/verify-round42-text.js` **67 项全过**(第四十三轮又补了 7 项地址栏用例)：A 段单元 12 项(模板枚举、system 不可注入、拆分镜四类脏输出、计价优先级)；B 段 Mock chat 网关 11 项(请求体形态、`rules` 改 path/内容路径、HTTP 错误、空内容、超长/未知任务拦截)；C 段真实接口 14 项(模型清单、四类 400、`tasks` 落库与 token 用量、免费 0 分/付费扣分、默认文本模型能存住且真的生效、文本模型不混入生图列表)；E 段后台链路 7 项(文本模型检查通过且探活打 /chat/completions、自检走 chat 落 tasks 且免费不扣分、错配 openai-video 仍被拦、临时模型清理干净 —— 用 Mock 网关保证不依赖服务商当天的排队速度)；D 段界面 22 项(入口存在且不被裁切、菜单四项带计价、模型可一键切换且请求带上 model_id、后台类型与协议、设置页字段)。**套件本身零真实费用**(D 段只开菜单不发请求)。
+- 真实调用(免费模型 + 1 次 DeepSeek)：`polish` 91 → 287 字；`to_video_prompt` 输出一段式可用提示词；`split_shots` 13 镜；`condense` 走 DeepSeek 扣 1 分(余额 10037 → 10036)。
+- **浏览器端到端**(临时项目，跑完已删)：`AI 拆分镜` 1 → 10 镜(标题/时长/画面描述都成立)；`扩写细节` 49 → 396 字且 textarea 同步、工作记录持久化 10 镜；`压缩精简` 64 → 27 后菜单出现「撤销上一次 AI 改写」，点击还原到 64 字并清除撤销栈；无横向溢出、无未捕获异常。
+- 回归：`verify-round22.js`、`verify-round25-imagegen.js` 40 项、`verify-round29-uiux.js`、`verify-round39-quota.js` 39 项、`verify-round40-modelcfg.js` 28 项、`verify-round41-async-image.js` 17 项全绿。其中 round40 的一处断言修好了依赖：它按**精确大小写前缀**找模型选项，管理员把 `agnes-image-2.5-flash` 改名成 `Agnes-image-...` 后静默读到上一个模型的读数 —— 改成大小写不敏感并在找不到时显式失败。
+
+
+## 第四十一轮修复(中转站异步生图「已扣费却没有结果图片」→ `rules.async` 收单)
+
+### 现象与根因
+
+用户配置 `gpt-image-2.5-sunburst` `m-4002e640ddb6f973`(中转站 `https://ys666.site/v1`),站内显示已扣费,平台任务 `t-239ed85c1c9d30bb` 却失败,错误是 `生图响应中没有结果图片: {"data":[],"id":"creative_06f3…","status":"queued"}`。
+
+根因:该模型(及同系 `-flare`)在 OpenAI 兼容端点上是**异步受理** —— POST 立刻回 HTTP 200 + `status:"queued"` + `data:[]`,图要另走「任务状态 → 素材清单 → 素材内容」三段取件。平台的 `openai-image` 只认同步响应,于是「已受理」被当成「无结果」判失败,而网关照常计费(实测 `actual_cost` 0.08 美元/张)。
+
+### 实测契约(三段取件全部要求 `x-creative-contract-version: 1`,缺头返回 409 `CREATIVE_CONTRACT_VERSION_MISMATCH`)
+
+| 步骤 | 端点(相对 `api_base`) | 要点 |
+|---|---|---|
+| 提交 | `POST /images/generations` | OpenAI 兼容体 `{model,prompt,n,size}`;**`size` 不参与预校验**(`1x1` 照样受理),`n`/`prompt` 会 400 |
+| 状态 | `GET /creative/tasks/<job_id>` | `queued → running → completed`;带 `output_count / success_count / actual_cost`,**不含图片地址** |
+| 清单 | `GET /creative/assets?job_id=<job_id>` | 返回 `[{id, mime_type, size_bytes,…}]`;只有 `job_id=` 过滤生效(`task_id=`/`job=` 会被忽略返回全量) |
+| 内容 | `GET /creative/assets/<asset_id>/content` | 图片字节(PNG,内嵌 C2PA 出处元数据) |
+
+顺带记录:该站还有 `GET /v1/creative/tasks`(任务列表)、`GET /v1/videos/<id>`(视频侧取件,同一个契约头),而 `GET /v1/models` 会返回每个模型的 `parameter_schema` 与 `x-operations` —— **免费的契约发现入口**,排查新网关先打它。
+
+### 修复
+
+1. `server/imagegen.js` 新增**规则驱动**的异步收单 `rules.async`:`job_id_path / pending_field / pending_values / task_path / task_headers / status_field / status_values / error_field / assets_path / assets_data_path / asset_id_field / content_path / interval_ms / timeout_ms`。路径一律相对 `api_base`,`<job_id>` `<asset_id>` 令牌自动 URL 编码;素材清单里每条都落盘,下载仍走按魔数嗅探的 `writeImageBuffer`;超时/失败都带上 task id 与「图仍在服务方,可到站内核对」的提示。
+2. `normalizeRules()` 的合并键补上 `async` —— 原来只并 `create/response/limits`,新规则会被静默吞掉(测试第一条就抓到了)。
+3. 未配 `rules.async` 时不再抛误导性的「响应中没有结果图片」,改为点明「网关已受理(task …)但按异步出图,请补 `rules.async`,否则图取不回来而网关照常计费」。
+4. `downloadImage()` 支持带请求头(取件端点要契约头)。
+5. `m-4002e640ddb6f973`(sunburst)已按上表配好规则并跑通。同系另外两个也建成模型:`中转站 gpt-image-2.5-flare` `m-c152926aaeaabec4`(像素尺寸形态,复用同一段 `async`)与 `中转站 Nano-banana(gemini-3.1-flash-image)` `m-f688afb4fdf6f778` —— 后者按 `/v1/models` 的 `parameter_schema` 是**档位收参**(`resolution` 512/1K/2K/4K + `aspect_ratio`),故 `create.body` 用 `<resolution>`/`<aspect_ratio>`(`size_mode=tier`);两者的 `async` 段是惰性兜底,网关若同步返回则完全不参与。两个新模型只做了**零成本可用性预检**(`n=99` → 400 `invalid_n`,证明 model id 与 Key 权限通过、未建单),真实出图尚未验证;图生图能力先关掉(其 multipart `/images/edits` 路径未验证,不暴露会计费却可能失败入口)。
+
+### 验证
+
+- 新增 `test/verify-round41-async-image.js` **17 项全过**:Mock 网关复刻 `queued → running×2 → completed`、缺契约头 409、两条素材全部落盘、PNG 魔数、按 `job_id` 过滤、失败态与超时态文案、未配 `async` 的可读报错。全程零真实费用。
+- **平台内真实端到端**:`t-51edd408b654ef89`(16:9 · 2K)→ **36s completed · cost 2 积分**,资产 `a-f4c61c922b38bf3d` → `data/uploads/u-admin/a-f4c61c922b38bf3d.png` **1536×1024 · 1.85MB PNG**,画面与提示词完全一致(银发仙冠、红丝带、银黑多层汉服、纯白背景全身立绘)。
+- 回归:`verify-round25-imagegen.js` 40 项、`verify-round39-quota.js` 39 项、`verify-round40-modelcfg.js` 28 项全绿。
+- 后端有改动,3088 已重启为最新代码(PID 97643,日志 `/tmp/vf-3088.log`);重启前按第四十轮的教训把「有 `processing` 任务就不重启」做成了硬门槛。
+
+### 诊断成本(如实记录)
+
+为定位这套契约,除用户原任务外又建了 **3 个异步单**(`size:"1x1"` 探针、首发 A、重投 B,各 0.08 美元)。原因:该网关的 `size` 不参与预校验,所以「用非法参数探契约、不建单不花钱」这条老办法对它无效 —— 对异步受理型网关,只能靠 `/v1/models` 元数据与站内已有 task id 反查。用户原先那张已付费的图已从站内取回:`/tmp/recovered-06f3e122-1.png`(2.34MB PNG)。
+
+
+## 第四十轮修复(模型计费/额度可手动设置 · 画幅比例参数在生图页丢失)
+
+### 改前实测
+
+1. **生图页没有「画幅比例」下拉**:`百炼 Qwen-Image 3.0（免费额度）` 与 `智谱 CogView-3-Flash（免费）` 的面板只有「分辨率 + 张数」(用户截图印证),而两者 `params_schema` 里都实打实写了 5 个比例档。根因是前端 `ImagesView.ratioDef()` 只认 **`ratio`** 键,而这两类模型(以及全部视频模型)的模板键是 **`aspect_ratio`** —— 服务端 `imagegen.ratiosOf()` 与 `tasks.js` 早就双键兼容,**只有前端漏了**,所以「后台设了参数、生成时选不了」。
+2. 后台编辑器同样只按 `ratio` 回显比例标签,保存时又写回 `ratio` → 键名继续分裂,下次改模型还会把 `aspect_ratio` 悄悄换掉。
+3. 「支持的分辨率档」留空时编辑器**一律塞 `1K,2K,4K`**,于是只支持单档的智谱模型也有三档可选:实测 `t-131adb74ae60951f` 选了 4K,服务端就近吸附回 1024x1024,但任务参数里记的是 `resolution:"4K"` —— 属于「能选但无效」。
+4. `is_free` 字段后端 `POST/PATCH /api/admin/models` 都不接收,第三十七 / 三十九轮的免费标记全靠 SQL 置位。
+
+### 修复
+
+1. **后端**:`POST /api/admin/models` 的 INSERT 与 `PATCH` 都接受 `is_free`(免费 = 不扣平台积分,与服务商是否收费无关)。
+2. **编辑器新增控件**:「计费方式」(免费 ⇄ 按积分)与「免费额度」(总量 + 单位 自动/张/秒,写入 `rules.quota`,留空即取消登记);选免费时积分输入禁用、hint 改为「此价不生效」。至此模型侧**不需要再手写 JSON 或改库**就能设:启用、并发、计费、免费额度、积分单价、能力勾选、比例/分辨率/尺寸清单、张数上限、协议规则。
+3. **清单同源**:保存生图模型时把界面上的分辨率档与画幅比例一并写回 `rules.limits.resolutions` / `rules.limits.aspect_ratios`,让「下拉能选什么」和「服务端按什么吸附」永远一致。
+4. **双键读取**:`ImagesView.ratioDef`、分镜生图弹窗 `renderParams`、编辑器回显三处统一 `aspect_ratio` 优先 + 兼容 `ratio`;编辑器保存改写 `aspect_ratio`。存量 `ratio` 模型(本地占位、`agnes-image-2.5-flash`、`gpt-image-2`)行为不变,下次保存自动归一。
+5. **档位不再强塞**:`parseResTiers()` 留空时优先取 `rules.limits.resolutions`,两者都没有才回退 `1K/2K/4K`;输入框回显同样优先取规则清单。
+6. **数据修正**:`智谱 CogView-3-Flash（免费）` 的 `params_schema.resolution` 由 `["1K","2K","4K"]` 改回 `["1K"]`,与 `rules.limits.resolutions` 对齐。
+
+### 验证
+
+- 新增 `test/verify-round40-modelcfg.js` **28 项全过**:A 段在**隔离实例**(`PORT=3097` + `DATA_DIR` 临时库,跑本轮新代码)验证 `is_free` 建/切、`rules.quota` 登记与取消、按张累计已用、切按积分后真实扣分、视频 `unit` 缺省推断为秒 —— 全程只用本地占位生图(`img-ffmpeg`),不外呼任何网关;B 段在真实页面验证 `ratioDef` 双键、智谱/百炼生图页重新出现画幅比例、旧键模型不受影响、编辑器回显与控件联动、参数模板预览键名归一。
+- 回归:`verify-round39-quota.js` 39 项、`verify-round26-imgopts.js` 37 项、`verify-round29-uiux.js` 全绿。
+
+### 交付时注意
+
+- 后端 `is_free` 改动需要重启 3088 才生效,已重启为最新代码(PID 90370,日志 `/tmp/vf-3088.log`),并用一个临时本地模型验证过 `POST is_free=1 → PATCH 0 → PATCH 1 → 列表 free_quota → 删除` 全链路。
+- **本轮重启有一次打断**:重启瞬间库里正有一条 `processing` 的生图任务 `t-c0bcfdf97c02fd91`(它的模型 `m-2fea401c7891d1b2` 也已被删除),被一起带走。开机清扫把它重投后,worker 在调用网关前就因「生图模型不存在」判失败并**自动退回 2 积分**(`refunded=1`),平台侧无损失;但那一瞬间上游可能已受理计费,这是第三十八轮就写进错误文案的老风险(计费请求不自动重试)。教训:**重启前的 `processing` 判定必须能中止重启**,不能只查不拦。
+- 顺带确认:任务进行中删除模型不会留下孤儿任务 —— worker 会重读模型行,以「生图模型不存在」判死并退分(另一条 `t-e69a35f592779012` 同样如此收尾)。
+
+
+## 第三十九轮优化(智谱 CogView-3-Flash 接入 · 免费额度余量标注)
+
+### 接入前先实测(零成本探针优先)
+
+1. **探针**:`POST https://open.bigmodel.cn/api/paas/v4/images/generations` 带 `size:"1x1"` → **HTTP 400 · 0.2s**
+   `{"error":{"code":"1214","message":"size的长宽均需满足512px-2880px之间,且为16整数倍,并保证最大像素数不超过2^21px"}}`
+   —— 鉴权与端点确认,参数在服务端预校验阶段就被拒,**不建任务、不消耗额度**,顺带把尺寸约束问全。
+2. **真实出图**:`cogview-3-flash`(**免费档,标价 0 元**;`cogview-3` / `cogview-3-plus` 是付费档,未碰)· 1024x1024 → **HTTP 200 · 8.5s**,结果在 `data[0].url`,免费模型**不返 `usage`**。
+3. **坑:URL 名义 `.png`,字节是 baseline JPEG**(魔数 `ffd8ffe0`,文件名还带 `_watermark`)。平台 `writeImageBuffer` 本来就按魔数嗅探格式,所以落盘自动成 `.jpg` + `mime=image/jpeg`,**无需改代码**;画面肉眼也无水印。
+
+### 平台内新增模型(纯 rules 配置,无代码分支)
+
+`智谱 CogView-3-Flash（免费）` `m-c3e336b531429365`,复用 CogVideoX-Flash 那把 Key 与 `openai-image` 协议:
+
+```json
+{"protocol":"openai-image",
+ "create":{"path":"/paas/v4/images/generations","edit":"none",
+           "body":{"model":"<model_id>","prompt":"<prompt>","size":"<size>"}},
+ "response":{"data_path":"data","url_field":"url"},
+ "limits":{"max_count":1,"resolutions":["1K"],
+           "sizes":["1024x1024","1344x768","768x1344","1152x864","864x1152","1440x720","720x1440"],
+           "aspect_ratios":["1:1","16:9","9:16","4:3","3:4"]},
+ "caps":["text-to-image"]}
+```
+
+- `is_free=1`(管理端模型接口没有这个字段,仍按前几轮做法 SQL 置位)。
+- **端到端**:`t-16e87936c4ab7def`(1:1)→ **8.7s completed · cost=0**,资产 `a-399077a7e6dd40a0` → `data/uploads/u-admin/a-399077a7e6dd40a0.jpg` **1024×1024 · 154KB**,模型统计 `success_count=1 · avg 8701ms`。
+- `limits.resolutions` 收成 `['1K']`:智谱合法尺寸都在 1K 量级,此前界面默认送 `resolution:"4K"` 虽被就近吸附不出错,但任务参数里记的是 4K —— 属于「让用户选出会被服务端改掉的选择」。
+- 顺带修正:`agnes-image-2.5-flash(免费)` `m-85b87771f761af19` 名字写免费但 `is_free=0`,一直按全局 `creditPerImage=2` 扣积分(历史 38 个任务共扣 316 分,**未追溯退还**),现已置 `is_free=1`。
+
+### 免费额度余量标注(本轮需求 2)
+
+额度总量登记在模型规则 `rules.quota = {"total":10,"unit":"image"}`(`unit` 省略时按模型类型推断:生图=张 / 视频=秒),统计口径与展示面:
+
+1. 新模块 `server/quota.js`:已用量 = **平台内成功任务**的消耗(生图累加 `params.count`,视频累加 `params.duration`;失败/取消不计),`remaining = max(0, total - used)`,用满置 `exhausted`;`rules` 非法或未登记 → `declared:false`,不报错。一批模型只查一次 `tasks`。
+2. `/api/styles/models` 与 `/api/images/models` 新增 `free_quota` 字段(付费模型为 `null`)。
+3. 界面**复用既有文案位,不新增常驻占位**(公共函数 `modelOptionLabel()` / `freeQuotaText()` 在 `public/js/ui.js`);下拉项里名称已含「免费」的模型(如「百炼 Qwen-Image 3.0（免费额度）」)不再重复标注,只追加余量 —— `<select>` 宽度有限,重复后缀会把余量挤出可见区:
+   - 生图页、分镜生图弹窗、工作台视频模型下拉:`百炼 Qwen-Image 3.0（免费额度） · 剩 8/10张`(名称不含「免费」时才是 `xxx(免费 · 剩 8/10张)`);
+   - 生图页模型提示行:`免费模型 · 不消耗积分 · 额度剩 8/10张(平台内已用 2张)`,用满时整行变 `⚠ 平台内已消耗满登记额度(10张)，继续提交可能被服务商拒绝`;
+   - 后台「模型管理 → 积分」列:`免费 / 额度 剩 13/30秒 · 已用 17`,未登记额度的免费模型显示**「未登记额度」**,tooltip 直接给出 `rules.quota` 的写法。
+4. **口径边界(重要)**:只统计走平台的消耗 —— 直连网关、控制台、其他工具的用量平台看不到,所以文案统一写「平台内已用」;也**不做提交前拦截**(百炼已开「用完即停」,超了由服务商拒,平台不替用户猜)。
+
+已登记额度的模型与当前快照(2026-10-26 实测):
+
+| 模型 | 登记额度 | 平台内已用 | 剩 |
+|---|---|---|---|
+| 百炼 Wan3.0-Video（免费额度） | 30 秒 | 17 | **13 秒** |
+| 百炼 Wan3.0-Video Prime（免费额度） | 30 秒 | 10 | **20 秒** |
+| 百炼 Qwen-Image 3.0（免费额度） | 10 张 | 2 | **8 张** |
+| 百炼 Qwen-Image 3.0 Pro（免费额度） | 10 张 | 3 | **7 张** |
+| 百炼 Qwen-Image 2.1 Pro（免费额度） | 10 张 | 0 | **10 张** |
+| 百炼 Qwen-Image 2.1 Turbo（免费额度） | 10 张 | 1 | **9 张** |
+| 智谱 CogView-3-Flash / CogVideoX-Flash、Agnes 视频与生图、本地占位 | 未登记 | — | 免费池按并发限流,无固定张数,不编数字 |
+
+### 验证
+
+- 新增 `test/verify-round39-quota.js` **39 项全过**:A 段隔离库(`DATA_DIR`)单测统计口径 8 项(张数/秒数累加、失败与取消不计、超出归零、未登记与非法 rules、非免费模型、批量索引);B 段真实库接口契约 + 与直接 SQL 交叉核对 19 项;C 段无头 Chrome 界面 12 项(下拉两种文案形态、提示行、后台额度列与 tooltip、无横向溢出、无未捕获异常)。**全程不调用付费模型,也不提交真实生成任务。**
+- 回归:`verify-round25-imagegen.js` 40 项、`verify-round26-imgopts.js` 37 项、`verify-round22.js`、`verify-round29-uiux.js` 全绿。
+- `verify-round17d-studio.js` 有 1 项失败「时长档位 13 档(3-15s)」:现有视频模型的时长档是 9 / 29 / 1 档,**已不存在 3–15s 的模型**,属数据性过期断言,与本轮改动无关,按惯例记录不修(不为凑绿灯回退数据)。
+- 后端有代码改动,3088 已用新代码重启(PID 78313,日志 `/tmp/vf-3088.log`);重启前确认无 `processing` 任务,`t-845afcc2b35e9bc2`(Agnes 排队延后)的 `next_at` 原样保留,未提前触发。
 
 
 ## 第三十八轮修复(中转站生图「已扣费却失败」:超时放宽 + 断流错误可读)

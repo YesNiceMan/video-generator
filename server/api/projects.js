@@ -7,6 +7,7 @@ const { requireAuth } = require('../auth');
 const { asyncRoute, httpError, uid, now, clamp } = require('../util');
 const { db, genProjectCode, getSettings, DATA_DIR } = require('../db');
 const { exportEpisode } = require('../ffmpeg');
+const storage = require('../storage');
 
 const r = Router();
 
@@ -21,7 +22,9 @@ r.get('/config', requireAuth, asyncRoute(async (req, res) => {
     aspectRatios: PROJECT_RATIOS,
     fpsOptions: PROJECT_FPS,
     /* 第二十五轮:生图每张积分定价(前端快捷生图弹窗计价展示用) */
-    creditPerImage: Math.max(0, Number(s.creditPerImage ?? 2))
+    creditPerImage: Math.max(0, Number(s.creditPerImage ?? 2)),
+    /* 第四十二轮:文本处理每次积分(前端剧本工具条计价展示用) */
+    creditPerText: Math.max(0, Number(s.creditPerText ?? 1))
   });
 }));
 
@@ -88,8 +91,9 @@ function projectWithTree(projectId) {
   for (const ep of episodes) {
     ep.scenes = db.prepare('SELECT * FROM scenes WHERE episode_id=? ORDER BY order_index').all(ep.id);
     for (const sc of ep.scenes) {
-      sc.clips = db.prepare(`SELECT c.*, a.name AS asset_name, a.type AS asset_type, a.thumb_path, a.path AS asset_path
-        FROM clips c LEFT JOIN assets a ON a.id=c.asset_id WHERE c.scene_id=? ORDER BY c.order_index`).all(sc.id);
+      sc.clips = db.prepare(`SELECT c.*, a.name AS asset_name, a.type AS asset_type, a.thumb_path
+        FROM clips c LEFT JOIN assets a ON a.id=c.asset_id WHERE c.scene_id=? ORDER BY c.order_index`).all(sc.id)
+        .map(c => ({ ...c, thumb_path: c.asset_id && c.thumb_path ? `/api/assets/${c.asset_id}/thumbnail` : null }));
     }
   }
   p.episodes = episodes;
@@ -406,17 +410,17 @@ r.get('/projects/:id/export', requireAuth, asyncRoute(async (req, res) => {
   for (const ep of episodes) {
     const rows = db.prepare(`SELECT c.duration, a.path, a.type FROM clips c JOIN scenes s ON c.scene_id=s.id JOIN assets a ON a.id=c.asset_id
       WHERE s.episode_id=? ORDER BY s.order_index, c.order_index`).all(ep.id);
-    for (const c of rows) clips.push({ path: c.path, duration: c.duration, type: c.type });
+    for (const c of rows) clips.push({ path: storage.toAbs(c.path), duration: c.duration, type: c.type });
   }
   if (!clips.length) throw httpError(400, '所选分集没有可导出的片段');
+  const missing = clips.filter(c => !storage.exists(c.path));
+  if (missing.length) throw httpError(400, `${missing.length}/${clips.length} 个片段的素材文件不在 ${DATA_DIR} 下(跨机器迁移请一并复制 data/ 目录)`);
 
   const width = clamp(Number(req.query.width) || 1920, 640, 3840, 1920);
   const height = clamp(Number(req.query.height) || 1080, 360, 2160, 1080);
   const outFile = path.join(EXPORTS, `${p.id}_${episodeId || 'season'}_${Date.now()}.mp4`);
   await exportEpisode({ clips, output: outFile, width, height });
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent((episodeId ? '分集' : '整季') + '_' + p.name + '.mp4')}"`);
-  fs.createReadStream(outFile).pipe(res);
+  storage.streamFile(res, outFile, { mime: 'video/mp4', attachment: true, name: (episodeId ? '分集' : '整季') + '_' + p.name + '.mp4' });
 }));
 
 module.exports = r;

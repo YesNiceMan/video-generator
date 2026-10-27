@@ -5,6 +5,12 @@ const ROW_STEP = 30;   /* 任务监控每次多渲染的行数：整表 200 行�
 /* 生图任务没有 duration/fps，此前统一渲染成「—s @ —fps」，一列噪声 */
 const taskParamsText = t => {
   const p = t.params || {};
+  /* 第四十二轮：文本处理任务(剧本润色/拆分镜等)没有时长与张数,按字数显示 */
+  if (p.engine === 'textgen') {
+    const label = p.selftest ? '文本模型自检' : (TEXT_TASK_LABELS[p.task] || p.task || '文本');
+    return label + ' · ' + (p.chars_in || 0) + '→' + (p.chars_out || 0) + ' 字'
+      + (p.shots ? ' · ' + p.shots + ' 镜' : '') + (p.ms ? ' · ' + Math.round(p.ms / 1000) + 's' : '');
+  }
   if (p.selftest) return '免费模型自检';
   if (p.count || p.size) return [p.aspect_ratio || p.size, p.count ? p.count + ' 张' : ''].filter(Boolean).join(' · ');
   if (p.duration || p.fps) return (p.duration || '—') + 's @ ' + (p.fps || '—') + 'fps';
@@ -14,10 +20,18 @@ const taskParamsText = t => {
 /* 网关排队已满的任务在 next_at 到点前不占 worker,列表要显示等待而不是静止的百分比 */
 const busyWaitSec = t => (t.status === 'queued' && t.next_at) ? Math.ceil((t.next_at - Date.now()) / 1000) : 0;
 
+/* 后台子标签写进地址(#/admin/tasks)，刷新与后退才不会再跳回第一个标签 */
+const ADMIN_TABS = ['models', 'credits', 'tasks', 'users', 'themes', 'settings'];
+/* 文本处理任务名(与服务端 textgen.TASKS 的 label 保持一致) */
+const TEXT_TASK_LABELS = {
+  polish: '润色剧本', expand: '扩写细节', condense: '压缩精简',
+  to_video_prompt: '转视频提示词', split_shots: '拆分镜', selftest: '文本自检'
+};
+
 const AdminView = {
   state: { tab: 'models', pollTimer: null, task: { status: 'all', q: '', limit: ROW_STEP } },
 
-  async render(root) {
+  async render(root, params) {
     root.innerHTML = '<div class="loading-wrap"><span class="spinner"></span></div>';
     this.root = root;
     if (App.user.role !== 'admin') {
@@ -25,7 +39,9 @@ const AdminView = {
       return;
     }
     this.renderUI();
-    this.switchTab('models');
+    /* 子标签写进地址(#/admin/tasks)，刷新/后退都能回到原来那一页；未知值回落模型管理 */
+    const want = params && params.tab ? String(params.tab) : '';
+    this.switchTab(ADMIN_TABS.includes(want) ? want : 'models');
     return () => this.stopPolling();
   },
 
@@ -50,7 +66,12 @@ const AdminView = {
       ${tabs.map(t => `<div class="tab" data-tab="${t.key}">${icon(t.icon, 'ico-sm')} ${t.label}</div>`).join('')}
     </div>
     <div id="adminBody"></div>`;
-    this.root.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => this.switchTab(t.dataset.tab)));
+    this.root.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+      const want = '#/admin/' + t.dataset.tab;
+      /* 走 hash 而不是直接 switchTab：地址栏跟着变，刷新与浏览器后退都停在同一页 */
+      if (location.hash === want) this.switchTab(t.dataset.tab);
+      else location.hash = want;
+    }));
   },
 
   switchTab(tab) {
@@ -102,14 +123,15 @@ const AdminView = {
       ffmpeg: '本地 ffmpeg',
       'openai-image': 'OpenAI 生图协议',
       'gemini-image': 'Gemini 生图协议',
-      'img-ffmpeg': '本地占位生图'
+      'img-ffmpeg': '本地占位生图',
+      'openai-chat': 'OpenAI Chat 协议'
     };
     return (PROTO[m.protocol] || '自动识别') + (m.rules && m.rules.protocol ? '' : ' · 自动');
   },
 
-  /* 模型类型友好名(第二十五轮：并入 AI 生图) */
+  /* 模型类型友好名(第二十五轮：并入 AI 生图;第四十二轮：并入文本处理) */
   typeLabel(m) {
-    const MAP = { 'image-to-video': '图生视频', 'text-to-video': '文生视频', 'text-to-image': 'AI 生图' };
+    const MAP = { 'image-to-video': '图生视频', 'text-to-video': '文生视频', 'text-to-image': 'AI 生图', 'text-generation': '文本处理' };
     return MAP[m.type] || m.type;
   },
 
@@ -135,7 +157,7 @@ const AdminView = {
           <button class="menu-item" id="selfTestBtn">${icon('flask-conical', 'ico-sm')}<span>测试免费模型(端到端自检)</span></button>
         </div>
       </div>
-      <button class="btn btn-primary" id="addModelBtn">${iconText('plus', '添加模型')}</button>
+      <button class="btn btn-primary" id="addModelBtn">${iconText('plus', '新建模型')}</button>
     </div>
     <div class="card" style="padding:0;overflow-x:auto"><table class="table">
       <thead><tr><th>模型</th><th>类型 / 协议</th><th>推理端点</th><th>并发</th><th>积分</th><th>状态</th><th>有效性</th><th>统计</th><th style="width:210px">操作</th></tr></thead>
@@ -146,9 +168,12 @@ const AdminView = {
           <td style="font-family:var(--mono);font-size:var(--fs-xs);color:var(--ink-2)">${m.api_base ? esc(m.api_base) + (m.has_api_key ? ' ' + icon('key-round', 'ico-xs') + '<span style="font-family:var(--mono);font-size:var(--fs-xs);color:var(--ok)" title="API Key 已配置(尾号 ' + esc(m.api_key_tail || '') + ')">KEY</span>' : '') : esc(m.endpoint || '—')}</td>
           <td class="num">${m.concurrency}</td>
           <td>${m.is_free ? '<span class="free-badge">' + icon('gift', 'ico-xs') + '免费</span>'
+            + (freeQuotaText(m)
+              ? '<br><span style="font-size:var(--fs-xs);color:var(--ink-3)" title="额度总量登记在模型规则 rules.quota,已用量按平台内成功任务统计(直连网关与控制台用量不计入)">额度 ' + esc(freeQuotaText(m)) + ' · 已用 ' + m.free_quota.used + esc(m.free_quota.unit_text || '') + '</span>'
+              : '<br><span style="font-size:var(--fs-xs);color:var(--ink-3)" title="在模型「生成规则 JSON」里加 &quot;quota&quot;:{&quot;total&quot;:30,&quot;unit&quot;:&quot;second&quot;} 即可显示余量">未登记额度</span>')
             : (Number(m.credit_per_second) > 0
-              ? '<b style="font-family:var(--mono);color:var(--ok)">' + m.credit_per_second + '</b> <span style="font-size:var(--fs-xs);color:var(--ink-3)">' + (m.type === 'text-to-image' ? '积分/张' : '积分/秒') + '</span>'
-              : '<span class="muted">' + (m.type === 'text-to-image' ? '全局定价 / 张' : '全局定价 / 秒') + '</span>')}</td>
+              ? '<b style="font-family:var(--mono);color:var(--ok)">' + m.credit_per_second + '</b> <span style="font-size:var(--fs-xs);color:var(--ink-3)">' + ('积分/' + (m.type === 'text-to-image' ? '张' : m.type === 'text-generation' ? '次' : '秒')) + '</span>'
+              : '<span class="muted">' + ('全局定价 / ' + (m.type === 'text-to-image' ? '张' : m.type === 'text-generation' ? '次' : '秒')) + '</span>')}</td>
           <td>${m.enabled ? '<span class="status status-completed">已启用</span>' : '<span class="status status-cancelled">已禁用</span>'}</td>
           <td>${this.mcBadge(m)}</td>
           <td class="muted">成功 ${m.success_count} · 失败 ${m.fail_count}<br>平均 ${Math.round((m.avg_duration_ms || 0) / 1000)}s</td>
@@ -240,8 +265,8 @@ const AdminView = {
           if (['completed', 'failed', 'cancelled'].includes(task.status)) {
             clearInterval(timer);
             done = true;
-            if (task.status === 'completed') toast(`✅ 自检成功：「${m.name}」渲染管线正常(${Math.round((task.duration_ms || 0) / 1000)}s)`, 'ok');
-            else toast(`❌ 自检失败：${task.error || task.status}`, 'err');
+            if (task.status === 'completed') toast(`自检成功：「${m.name}」渲染管线正常(${Math.round((task.duration_ms || 0) / 1000)}s)`, 'ok');
+            else toast(`自检失败：${errBrief(task.error) || task.status}`, 'err');
             if (this.state.tab === 'models') this.renderModels(this.root.querySelector('#adminBody'));
           }
         } catch (e) { clearInterval(timer); }
@@ -287,9 +312,10 @@ const AdminView = {
       <div class="form-row">
         <div class="field" style="flex:2"><label>模型名称</label><input class="input" id="emName" value="${esc(m.name || '')}" placeholder="如： GPT-Video"></div>
         <div class="field"><label>类型</label><select class="select" id="emType">
-          <option value="image-to-video" ${m.type !== 'text-to-video' && m.type !== 'text-to-image' ? 'selected' : ''}>图生视频</option>
+          <option value="image-to-video" ${!m.type || m.type === 'image-to-video' ? 'selected' : ''}>图生视频</option>
           <option value="text-to-video" ${m.type === 'text-to-video' ? 'selected' : ''}>文生视频</option>
           <option value="text-to-image" ${m.type === 'text-to-image' ? 'selected' : ''}>AI 生图</option>
+          <option value="text-generation" ${m.type === 'text-generation' ? 'selected' : ''}>文本处理</option>
         </select></div>
         <div class="field"><label>版本</label><input class="input" id="emVersion" value="${esc(m.version || 'v1')}"></div>
       </div>
@@ -356,8 +382,8 @@ const AdminView = {
             </select></div>
         </div>
         <div class="field"><label>支持的分辨率档(逗号分隔)</label>
-          <input class="input" id="emResTiers" value="${(() => { const rd = (m.params_schema || []).find(d => d && d.key === 'resolution'); const ls = m.rules && m.rules.limits && m.rules.limits.resolutions; const v = (rd && Array.isArray(rd.options)) ? rd.options : (Array.isArray(ls) ? ls : []); return v.map(String).join(', '); })()}" placeholder="留空 = 1K, 2K, 4K；也可写 1K, 2K, 3K, 4K 或直接写像素 1024, 2048">
-          <div class="hint">生图页「分辨率」下拉就按这里渲染 —— 新网关支持什么档位，改这条即可，无需改代码(26·9)</div></div>
+          <input class="input" id="emResTiers" value="${(() => { const rd = (m.params_schema || []).find(d => d && d.key === 'resolution'); const ls = m.rules && m.rules.limits && m.rules.limits.resolutions; const v = (Array.isArray(ls) && ls.length) ? ls : ((rd && Array.isArray(rd.options)) ? rd.options : []); return v.map(String).join(', '); })()}" placeholder="留空 = 按模型规则里的 resolutions 清单，都没有才用 1K, 2K, 4K">
+          <div class="hint">生图页「分辨率」下拉就按这里渲染，保存时也会同步回 <code>rules.limits.resolutions</code> —— 网关只支持单档就只写一档，别让界面选出被服务端改掉的值(26·9 / 40·2)</div></div>
         <div class="field"><label>固定尺寸清单(可选，高级)</label>
           <input class="input" id="emSizeCustom" value="${(() => { const sd = (m.params_schema || []).find(d => d && d.key === 'size'); if (sd && sd.options) return sd.options.join(', '); const ls = m.rules && m.rules.limits && m.rules.limits.sizes; return Array.isArray(ls) ? ls.join(', ') : ''; })()}" placeholder="留空 = 由 比例 × 分辨率 自动换算；或输入 API 仅支持的固定尺寸，如 1024x1024, 1536x1024(逗号/空格分隔)">
           <div class="hint">仅当生图 API 只接受特定「像素尺寸」时填写：提交会按所选 比例 × 分辨率 换算后，向此清单就近吸附(同方向优先);留空则直接使用换算尺寸</div></div>
@@ -388,6 +414,7 @@ const AdminView = {
             <option value="openai-image" ${m.rules && m.rules.protocol === 'openai-image' ? 'selected' : ''}>OpenAI 生图兼容协议(规则可配)</option>
             <option value="gemini-image" ${m.rules && m.rules.protocol === 'gemini-image' ? 'selected' : ''}>Google Gemini 生图(generateContent)</option>
             <option value="img-ffmpeg" ${m.rules && m.rules.protocol === 'img-ffmpeg' ? 'selected' : ''}>本地占位生图(免费测试)</option>
+            <option value="openai-chat" ${m.rules && m.rules.protocol === 'openai-chat' ? 'selected' : ''}>OpenAI Chat 兼容协议(文本处理)</option>
           </select>
           <div class="hint">添加新模型时通常选「自动识别」即可 —— 系统按模型 ID 特征匹配内置适配器；接入全新网关可选「OpenAI 视频通用协议」并微调下方规则，无需改代码。</div></div>
         <div class="field"><label>生成规则 JSON(可选)</label><textarea class="textarea" id="emRules" rows="7" spellcheck="false" style="font-family:var(--mono);font-size:11.5px" placeholder='{"create":{"path":"/videos","body":{"model":"<model_id>","prompt":"<prompt>","seconds":"<seconds>"}},"query":{"path":"/agnesapi","params":{"video_id":"<video_id>","model_name":"<model_id>"}}}'>${m.rules && Object.keys(m.rules).length ? esc(JSON.stringify(m.rules, null, 2)) : ''}</textarea>
@@ -400,6 +427,21 @@ const AdminView = {
       <div class="field"><label>推理端点(可选，兼容旧配置)</label><input class="input" id="emEndpoint" value="${esc(m.endpoint || '')}" placeholder="gpu://… 或 api://https://host/path 或 local://ffmpeg/free"></div>
       <div class="form-row">
         <div class="field"><label>并发限制</label><input class="input" id="emConcurrency" type="number" min="1" max="64" value="${m.concurrency || 1}"></div>
+        <div class="field"><label>计费方式</label><select class="select" id="emBilling">
+          <option value="free" ${m.is_free ? 'selected' : ''}>免费(不扣平台积分)</option>
+          <option value="paid" ${m.is_free ? '' : 'selected'}>按积分消耗</option>
+        </select>
+          <div class="hint">「免费」只决定平台侧是否扣用户积分，与服务商是否收费无关</div></div>
+        <div class="field" id="emQuotaField"${m.is_free ? '' : ' hidden'}><label>免费额度(可选)</label>
+          <div class="ig-seed-row">
+            <input class="input" id="emQuotaTotal" type="number" min="1" step="1" value="${esc(String((m.rules && m.rules.quota && m.rules.quota.total) || ''))}" placeholder="总量，留空 = 不登记">
+            <select class="select" id="emQuotaUnit" style="max-width:92px">
+              <option value="" ${!(m.rules && m.rules.quota && m.rules.quota.unit) ? 'selected' : ''}>自动</option>
+              <option value="image" ${m.rules && m.rules.quota && m.rules.quota.unit === 'image' ? 'selected' : ''}>张</option>
+              <option value="second" ${m.rules && m.rules.quota && m.rules.quota.unit === 'second' ? 'selected' : ''}>秒</option>
+            </select>
+          </div>
+          <div class="hint">登记后模型下拉与后台会显示「剩 X/总量」；已用量按<b>平台内成功任务</b>统计(生图计张数、视频计秒数)，直连网关与控制台用量不计入</div></div>
         <div class="field"><label id="emCpsLabel">每秒积分消耗 <span class="hint" style="font-weight:400">(积分/秒)</span></label>
           <input class="input" id="emCps" type="number" min="0" step="0.5" value="${Number(m.credit_per_second) > 0 ? m.credit_per_second : ''}" placeholder="留空按全局定价">
           <div class="hint" id="emCpsHint">设置后该模型按 秒数×单价 向上取整，忽略全局段时长覆盖价；0/留空 = 全局定价；免费模型恒 0 分</div></div>
@@ -416,8 +458,10 @@ const AdminView = {
        比例 + 分辨率档驱动，自定义尺寸作为「支持清单」提交时就近吸附 */
     const imgBox = q('#emImgBox');
     const RATIO_PRESETS = ['1:1', '4:3', '3:4', '16:9', '9:16', '3:2', '2:3', '21:9'];
-    const RATIOS_ON = new Set((m.params_schema || []).find(d => d && d.key === 'ratio')
-      ? (m.params_schema.find(d => d.key === 'ratio').options || []).map(String)
+    /* 比例清单双键回显:aspect_ratio 为准,兼容早期键名 ratio */
+    const RATIO_DEF = (m.params_schema || []).find(d => d && (d.key === 'aspect_ratio' || d.key === 'ratio')
+      && Array.isArray(d.options) && d.options.length);
+    const RATIOS_ON = new Set(RATIO_DEF ? (RATIO_DEF.options || []).map(String)
       : ['1:1', '16:9', '9:16', '4:3', '3:4']);
     const applyRatioTags = () => {
       imgBox.querySelectorAll('.em-size-tag[data-ratio]').forEach(tag => {
@@ -457,10 +501,14 @@ const AdminView = {
       if (!raw) return [];
       return [...new Set(raw.split(/[,，；\s]+/).map(sx => sx.trim()).filter(sx => /^[0-9]+x[0-9]+$/.test(sx) || sx === 'auto'))];
     };
-    /* 分辨率档清单来自「支持的分辨率档」输入框(26·9:新网关只改后台,不改代码) */
+    /* 分辨率档清单来自「支持的分辨率档」输入框(26·9:新网关只改后台,不改代码)。
+       留空时优先跟随 rules.limits.resolutions(服务端吸附用的就是这份清单),
+       都没有才回退 1K/2K/4K —— 此前留空一律塞三档,只支持单档的网关会被选出无效值 */
+    const RULE_RES = (() => { const ls = m.rules && m.rules.limits && m.rules.limits.resolutions;
+      return Array.isArray(ls) && ls.length ? ls.map(String) : null; })();
     const parseResTiers = () => {
       const raw = ((q('#emResTiers') || {}).value || '').trim();
-      if (!raw) return RES_TIERS.slice();
+      if (!raw) return (RULE_RES || RES_TIERS).slice();
       return [...new Set(raw.split(/[,，；\s]+/).map(s => s.trim()).filter(Boolean))];
     };
     const syncResTierSelect = () => {
@@ -480,7 +528,7 @@ const AdminView = {
       const tiers = parseResTiers();
       const schema = [];
       if (ratios.length) {
-        schema.push({ key: 'ratio', label: '画幅比例', type: 'select', options: ratios, default: ratios[0] });
+        schema.push({ key: 'aspect_ratio', label: '画幅比例', type: 'select', options: ratios, default: ratios[0] });
       }
       /* 分辨率档:生图页统一展示「画幅比例 + 分辨率」，提交时由服务端
          按模型规则换算(26·3:档位用 1K/2K/4K 叫法;26·9:清单由管理员填) */
@@ -544,16 +592,29 @@ const AdminView = {
     /* 类型切换 → 显示/隐藏生图参数面板 + 积分字段文案 */
     const syncCpsLabel = () => {
       const isImg = q('#emType').value === 'text-to-image';
+      const free = q('#emBilling').value === 'free';
       const lbl = q('#emCpsLabel');
       if (lbl) lbl.textContent = isImg ? '积分消耗(每张)' : '每秒积分消耗';
       const hint = q('#emCpsHint');
-      if (hint) hint.textContent = isImg
-        ? '生图按「张数 × 单价」扣分；0/留空 = 用全局「AI 生图每张积分」定价；免费模型恒 0 分'
-        : '设置后该模型按 秒数×单价 向上取整，忽略全局段时长覆盖价；0/留空 = 全局定价；免费模型恒 0 分';
+      if (hint) hint.textContent = (isImg
+        ? '生图按「张数 × 单价」扣分；0/留空 = 用全局「AI 生图每张积分」定价'
+        : '设置后该模型按 秒数×单价 向上取整，忽略全局段时长覆盖价；0/留空 = 全局定价')
+        + (free ? '(当前计费方式为免费，此价不生效)' : '');
+    };
+    /* 计费方式(第四十轮):免费 ⇄ 按积分;免费时才显示额度登记,并按积分输入禁用 */
+    const syncBilling = () => {
+      const free = q('#emBilling').value === 'free';
+      const qf = q('#emQuotaField');
+      if (qf) qf.hidden = !free;
+      const cps = q('#emCps');
+      if (cps) cps.disabled = free;
+      syncCpsLabel();
     };
     q('#emType').addEventListener('change', () => { imgBox.hidden = q('#emType').value !== 'text-to-image'; syncCpsLabel(); });
+    q('#emBilling').addEventListener('change', syncBilling);
     applyRatioTags();
     syncCpsLabel();
+    syncBilling();
     updateSchemaHint();
 
     const detectBtn = q('#emDetectBtn'), msg = q('#emDetectMsg');
@@ -599,7 +660,7 @@ const AdminView = {
 
     const saveBtn = el(`<button class="btn btn-primary">${iconText(id ? 'save' : 'plus', id ? '保存' : '创建')}</button>`);
     const cancelBtn = el('<button class="btn">取消</button>');
-    const modal = openModal({ title: `${icon('brain-circuit', 'ico-sm')} ${id ? '编辑模型' : '添加模型'}`, size: 'modal-lg', body, footer: [cancelBtn, saveBtn] });
+    const modal = openModal({ title: `${icon('brain-circuit', 'ico-sm')} ${id ? '编辑模型' : '新建模型'}`, size: 'modal-lg', body, footer: [cancelBtn, saveBtn] });
     cancelBtn.addEventListener('click', () => modal.close());
     saveBtn.addEventListener('click', async () => {
       const name = q('#emName').value.trim();
@@ -612,6 +673,7 @@ const AdminView = {
         description: q('#emDesc').value.slice(0, 500),
         concurrency: Number(q('#emConcurrency').value) || 1,
         enabled: q('#emEnabled').value === '1',
+        is_free: q('#emBilling').value === 'free',
         api_base: q('#emApiBase').value.trim(),
         model_id: q('#emModelId').value.trim(),
         credit_per_second: Math.max(0, Number(q('#emCps').value) || 0),
@@ -640,6 +702,22 @@ const AdminView = {
       /* 固定尺寸清单(生图 API 仅支持特定尺寸时):写入 limits.sizes,提交时就近吸附 */
       if (isImageModel && customSizes.length) {
         rulesObj.limits = Object.assign({}, rulesObj.limits, { sizes: customSizes });
+      }
+      /* 第四十轮:把界面上勾的「分辨率档 / 画幅比例」同步进 limits —— 服务端吸附清单与
+         生图页下拉清单必须同源,否则用户能选出一个被服务端悄悄改掉的值 */
+      if (isImageModel) {
+        const tiers = parseResTiers();
+        const ratiosOn = [...RATIOS_ON];
+        if (tiers.length) rulesObj.limits = Object.assign({}, rulesObj.limits, { resolutions: tiers });
+        if (ratiosOn.length) rulesObj.limits = Object.assign({}, rulesObj.limits, { aspect_ratios: ratiosOn });
+      }
+      /* 免费额度登记:写 rules.quota;清空 = 取消登记(界面回到只显示「免费」) */
+      const qTotal = Math.floor(Number((q('#emQuotaTotal') || {}).value));
+      const qUnit = (q('#emQuotaUnit') || {}).value || '';
+      if (reqBody.is_free && Number.isFinite(qTotal) && qTotal > 0) {
+        rulesObj.quota = qUnit ? { total: qTotal, unit: qUnit } : { total: qTotal };
+      } else {
+        delete rulesObj.quota;
       }
       if (Object.keys(rulesObj).length) reqBody.rules = rulesObj;
       const keyVal = q('#emApiKey').value.trim();
@@ -881,7 +959,7 @@ const AdminView = {
       <tbody>${users.map(u => `
         <tr>
           <td><div style="display:flex;align-items:center;gap:8px"><div class="avatar" style="width:26px;height:26px;font-size:12px">${avatar(u.name)}</div><div><b>${esc(u.name)}</b><br><span style="font-size:11px;color:var(--ink-3)">${esc(u.email)}</span></div></div></td>
-          <td>${u.role === 'admin' ? '<span class="tag">管理员</span>' : '<span class="tag" style="background:rgba(255,255,255,.06);color:var(--ink-2)">用户</span>'}</td>
+          <td>${u.role === 'admin' ? '<span class="tag">管理员</span>' : '<span class="tag" style="background:rgba(var(--film), .06);color:var(--ink-2)">用户</span>'}</td>
           <td>${fmtBytes(u.storage_used)}</td>
           <td>${fmtBytes(u.storage_quota)}</td>
           <td><b style="font-family:var(--mono);color:var(--ok)" data-bal-row="${u.id}">${u.credits != null ? u.credits : '—'}</b>${reqByUser[u.id] ? ` <span class="cc-pending" title="待审批申请">${reqByUser[u.id]}</span>` : ''}</td>
@@ -912,42 +990,42 @@ const AdminView = {
     }));
     body.querySelectorAll('[data-setquota]').forEach(b => b.addEventListener('click', async () => {
       const u = users.find(x => x.id === b.dataset.setquota);
-      const vals = await formModal({
+      await formModal({
         title: '设置配额',
         fields: [{ key: 'quota', label: '存储配额 (GB)', type: 'number', value: Math.round(u.storage_quota / 1024 ** 3) }],
-        submitText: '保存'
+        submitText: '保存',
+        onSubmit: async (vals) => {
+          await API.patch('/admin/users/' + u.id, { storage_quota: Number(vals.quota) * 1024 ** 3 });
+          toast('配额已更新', 'ok');
+          this.renderUsers(body);
+        }
       });
-      if (vals) {
-        await API.patch('/admin/users/' + u.id, { storage_quota: Number(vals.quota) * 1024 ** 3 });
-        toast('配额已更新', 'ok');
-        this.renderUsers(body);
-      }
     }));
     body.querySelectorAll('[data-setcredits]').forEach(b => b.addEventListener('click', async () => {
       const u = users.find(x => x.id === b.dataset.setcredits);
-      const vals = await formModal({
+      await formModal({
         title: `调整积分 · ${u.name}`,
         fields: [
           { key: 'delta', label: '变动数量(正数发放 / 负数扣减)', type: 'number', value: 100 },
           { key: 'reason', label: '备注', value: '', placeholder: '如： 活动奖励' }
         ],
-        submitText: '确认调整'
-      });
-      if (vals) {
-        try {
+        submitText: '确认调整',
+        onSubmit: async (vals) => {
           await API.post('/admin/users/' + u.id + '/credits', { delta: Number(vals.delta), reason: vals.reason });
           toast('积分已调整', 'ok');
           this.renderUsers(body);
-        } catch (e) { toast(e.message, 'err'); }
-      }
+        }
+      });
     }));
   },
 
   /* ---------- 系统设置(含积分定价) ---------- */
   async renderSettings(body) {
-    const [res, creditsRes] = await Promise.all([
+    const [res, creditsRes, textModelsRes] = await Promise.all([
       API.get('/admin/settings'),
-      API.get('/admin/credit-requests?status=all')
+      API.get('/admin/credit-requests?status=all'),
+      /* 第四十二轮:文本处理模型清单(默认模型下拉的唯一依据) */
+      API.get('/text/models').catch(() => ({ items: [] }))
     ]);
     const s = res.settings;
     const pricing = creditsRes.pricing || { perSecond: 5, overrides: {} };
@@ -969,6 +1047,14 @@ const AdminView = {
           <div class="hint">未配置覆盖价的时长按 秒数×单价 向上取整；免费模型恒为 0 分</div></div>
         <div class="field"><label>AI 生图单价(积分 / 张)</label><input class="input" id="setPerImage" type="number" min="0" step="0.5" value="${s.creditPerImage ?? 2}">
           <div class="hint">生图按张计价：张数 × 单价；免费生图模型恒为 0 分</div></div>
+        <div class="field"><label>文本处理单价(积分 / 次)</label><input class="input" id="setPerText" type="number" min="0" step="0.5" value="${s.creditPerText ?? 1}">
+          <div class="hint">剧本润色 / 拆分镜等按次计价；免费文本模型恒为 0 分</div></div>
+        <div class="field"><label>默认文本处理模型</label>
+          <select class="select" id="setDefaultText">
+            <option value="">自动(按列表顺序取第一个启用的文本模型)</option>
+            ${(textModelsRes.items || []).map(tm => `<option value="${esc(tm.id)}" ${String(s.defaultTextModel || '') === String(tm.id) ? 'selected' : ''}>${esc(tm.name)}${tm.is_free ? '（免费）' : '（' + tm.price_per_call + ' 分/次）'}</option>`).join('')}
+          </select>
+          <div class="hint">${(textModelsRes.items || []).length ? '分镜与剧本的 AI 按钮默认用这个模型；没有启用中的文本模型时按钮会提示去后台添加。' : '⚠ 当前没有可用的文本模型：请到「模型管理」添加，类型选「文本处理」。'}</div></div>
         <div class="field"><label>注册赠送积分</label><input class="input" id="setFreeCredits" type="number" min="0" value="${s.freeCredits ?? 100}"></div>
         <div class="field"><label>常用段时长定价</label>
           <div>
@@ -996,38 +1082,39 @@ const AdminView = {
         <button class="btn btn-primary" id="saveResolutions">保存尺寸设置</button>
       </div>
     </div>`;
-    body.querySelector('#saveSettings').addEventListener('click', async () => {
-      await API.patch('/admin/settings', {
-        maxConcurrentTasks: Number(body.querySelector('#setConcurrency').value),
-        defaultQuotaGB: Number(body.querySelector('#setQuota').value),
-        maxUploadMB: Number(body.querySelector('#setUpload').value),
-        gpuPool: body.querySelector('#setGpu').value
-      });
-      toast('设置已保存', 'ok');
-    });
-    body.querySelector('#savePricing').addEventListener('click', async () => {
+    body.querySelector('#saveSettings').addEventListener('click', () => this.saveWithBusy(body.querySelector('#saveSettings'), () => API.patch('/admin/settings', {
+      maxConcurrentTasks: Number(body.querySelector('#setConcurrency').value),
+      defaultQuotaGB: Number(body.querySelector('#setQuota').value),
+      maxUploadMB: Number(body.querySelector('#setUpload').value),
+      gpuPool: body.querySelector('#setGpu').value
+    }), '设置已保存'));
+    body.querySelector('#savePricing').addEventListener('click', () => {
       const overrides = {};
-      body.querySelectorAll('[data-tier]').forEach(inp => {
-        if (inp.value !== '') overrides[inp.dataset.tier] = inp.value;
-      });
-      try {
-        await API.patch('/admin/settings', {
-          creditPerSecond: Number(body.querySelector('#setPerSecond').value),
-          creditPerImage: Number(body.querySelector('#setPerImage').value),
-          freeCredits: Number(body.querySelector('#setFreeCredits').value),
-          creditOverrides: overrides
-        });
-        toast('积分定价已保存，新任务立即生效', 'ok');
-      } catch (e) { toast(e.message, 'err'); }
+      body.querySelectorAll('[data-tier]').forEach(inp => { if (inp.value !== '') overrides[inp.dataset.tier] = inp.value; });
+      return this.saveWithBusy(body.querySelector('#savePricing'), () => API.patch('/admin/settings', {
+        creditPerSecond: Number(body.querySelector('#setPerSecond').value),
+        creditPerImage: Number(body.querySelector('#setPerImage').value),
+        creditPerText: Number(body.querySelector('#setPerText').value),
+        defaultTextModel: body.querySelector('#setDefaultText').value,
+        freeCredits: Number(body.querySelector('#setFreeCredits').value),
+        creditOverrides: overrides
+      }), '积分定价已保存，新任务立即生效');
     });
-    body.querySelector('#saveResolutions').addEventListener('click', async () => {
+    body.querySelector('#saveResolutions').addEventListener('click', () => {
       const list = [...body.querySelectorAll('[data-vres]:checked')].map(x => x.dataset.vres);
       if (!list.length) return toast('至少勾选一个生成尺寸', 'err');
-      try {
-        await API.patch('/admin/settings', { videoResolutions: list });
-        toast('生成尺寸已保存，分镜创作页即时生效', 'ok');
-      } catch (e) { toast(e.message, 'err'); }
+      return this.saveWithBusy(body.querySelector('#saveResolutions'),
+        () => API.patch('/admin/settings', { videoResolutions: list }), '生成尺寸已保存，分镜创作页即时生效');
     });
+  },
+  /* 统一的「保存」按钮行为:请求期间禁用 + 文案提示,失败弹错并恢复 —— 三个设置卡共用 */
+  async saveWithBusy(btn, fn, okMsg) {
+    if (!btn || btn.disabled) return;
+    const label = btn.innerHTML;
+    btn.disabled = true; btn.textContent = '保存中…';
+    try { await fn(); toast(okMsg, 'ok'); }
+    catch (e) { toast(e.message, 'err'); }
+    finally { btn.disabled = false; btn.innerHTML = label; }
   },
   /* ---------- 主题管理：导入 / 导出 / 应用 / 删除 (含外部主题包上传) ---------- */
   async renderThemes(body) {

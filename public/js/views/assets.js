@@ -11,7 +11,7 @@ const AssetsView = {
     { key: '视频', icon: 'clapperboard' }
   ],
 
-  state: { folders: [], assets: [], total: 0, page: 1, currentFolder: null, type: 'all', category: 'all', q: '', shared: false, selectMode: false },
+  state: { folders: [], assets: [], total: 0, page: 1, size: PAGE_SIZE, currentFolder: null, type: 'all', category: 'all', q: '', shared: false, selectMode: false },
 
   async render(root) {
     root.innerHTML = '<div class="loading-wrap"><span class="spinner"></span></div>';
@@ -21,8 +21,15 @@ const AssetsView = {
     this.state.page = 1;
     this.state.shared = false;
     this.selected = new Set();
-    await this.load();
+    /* 先出外壳再取数据:每页条数要按网格实际列数排满整数行,得先量得到 #assetGrid 的宽度 */
+    this._loading = true;
     this.renderUI();
+    this._loading = false;
+    /* 每页 = 列数 × 4 行:整数行,最后一行不再空着几个位置 */
+    this.state.size = gridPageSize(this.root.querySelector('#assetGrid'), '--card-min');
+    await this.load();
+    this.renderFolders();
+    this.renderAssets();
   },
 
   /* 分页(26·1):资产库每页 20 条。此前一次拉全库(演示账号 125 项 → 网格近 9000px 高),
@@ -36,13 +43,13 @@ const AssetsView = {
         + '&type=' + st.type
         + '&category=' + encodeURIComponent(st.category)
         + '&q=' + encodeURIComponent(st.q)
-        + '&limit=' + PAGE_SIZE + '&offset=' + (Math.max(1, st.page) - 1) * PAGE_SIZE)
+        + '&limit=' + st.size + '&offset=' + (Math.max(1, st.page) - 1) * st.size)
     ]);
     this.state.folders = folderRes.items;
     this.state.assets = assetRes.items;
     this.state.total = assetRes.total != null ? assetRes.total : assetRes.items.length;
     /* 页码越界(筛选变严 / 删除掉最后一页)→ 回到实际最后一页重取 */
-    const pages = Math.max(1, Math.ceil(this.state.total / PAGE_SIZE));
+    const pages = Math.max(1, Math.ceil(this.state.total / st.size));
     if (st.page > pages) {
       st.page = pages;
       return this.load(opts);
@@ -81,7 +88,7 @@ const AssetsView = {
       <div class="page-head-main">
         <div class="page-eyebrow">${icon('folder-open')} Assets</div>
         <h1 class="page-title">资产库</h1>
-        <p class="page-sub">图片 / 视频 / 音频素材统一归档；分镜工作台按「角色 · 场景 · 物品」等分类引用，右击卡片可快捷操作。</p>
+        <p class="page-sub">图片 / 视频 / 音频统一归档；分镜工作台按「角色 · 场景 · 物品」等分类引用，右击卡片可快捷操作。</p>
       </div>
       <div class="page-actions">
         <div class="menu">
@@ -93,7 +100,7 @@ const AssetsView = {
             <button class="menu-item" id="astNewFolderBtn2">${icon('folder-plus', 'ico-sm')}<span>新建文件夹</span></button>
           </div>
         </div>
-        <button class="btn btn-primary" id="astUploadBtn">${iconText('upload', '上传素材')}</button>
+        <button class="btn btn-primary" id="astUploadBtn">${iconText('upload', '上传资产')}</button>
       </div>
     </div>
 
@@ -123,9 +130,11 @@ const AssetsView = {
         </div>
       </div>
       <div class="ast-main">
-        <div class="grid grid-cards" id="assetGrid"></div>
-        <div id="astEmpty" class="hidden empty"><div class="empty-ico">${icon('folder-open')}</div><h3>暂无资产</h3><p>点击「上传素材」添加，或调整上方的类型 / 分类 / 文件夹筛选</p></div>
-        <div id="astPager"></div>
+        <div class="ast-scroll">
+          <div class="grid grid-cards" id="assetGrid"></div>
+          <div id="astEmpty" class="hidden empty"><div class="empty-ico">${icon('folder-open')}</div><h3>暂无资产</h3><p>点击「上传资产」添加，或调整上方的类型 / 分类 / 文件夹筛选</p></div>
+        </div>
+        <div id="astPager" class="ast-pager"></div>
       </div>
     </div>
 
@@ -185,16 +194,16 @@ const AssetsView = {
   },
 
   async newFolder() {
-    const vals = await formModal({
+    await formModal({
       title: '新建文件夹',
       fields: [{ key: 'name', label: '文件夹名称', placeholder: '输入名称', value: '' }],
-      submitText: '创建'
+      submitText: '创建',
+      onSubmit: async (vals) => {
+        await API.post('/assets/folders', { name: vals.name, parent_id: this.state.currentFolder === 'root' ? null : this.state.currentFolder });
+        toast('文件夹已创建', 'ok');
+        this.loadAndRender();
+      }
     });
-    if (vals) {
-      await API.post('/assets/folders', { name: vals.name, parent_id: this.state.currentFolder === 'root' ? null : this.state.currentFolder });
-      toast('文件夹已创建', 'ok');
-      this.loadAndRender();
-    }
   },
 
   /* 分类筛选 chips */
@@ -238,7 +247,7 @@ const AssetsView = {
     if (!n) return;
     const st = this.state;
     const total = st.total != null ? st.total : st.assets.length;
-    const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+    const pages = Math.max(1, Math.ceil(total / st.size));
     n.innerHTML = `<b class="gold-num">${total}</b> 项`
       + (pages > 1 ? ` · 第 ${Math.min(st.page, pages)}/${pages} 页` : '')
       + (st.selectMode ? ' · 已选 ' + this.selected.size : '');
@@ -344,16 +353,17 @@ const AssetsView = {
     const keep = !!(opts && opts.keepSelection);
     const res = await API.get('/assets/shared-with-me');
     const items = res.items || [];
-    const pages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
+    const pages = Math.max(1, Math.ceil(items.length / st.size));
     if (this.state.page > pages) this.state.page = pages;
-    const start = (this.state.page - 1) * PAGE_SIZE;
-    this.state.assets = items.slice(start, start + PAGE_SIZE);
+    const start = (this.state.page - 1) * st.size;
+    this.state.assets = items.slice(start, start + st.size);
     this.state.total = items.length;
     if (this.selected && !keep) { for (const id of [...this.selected]) if (!items.some(a => a.id === id)) this.selected.delete(id); }
     this.renderAssets();
   },
 
   renderFolders() {
+    if (this._loading) return;
     const tree = this.root.querySelector('#folderTree');
     const items = [{ id: 'root', name: '全部资产', parent_id: null }].concat(this.state.folders);
     const rootChild = items.filter(i => !i.parent_id);
@@ -377,6 +387,7 @@ const AssetsView = {
   },
 
   renderAssets() {
+    if (this._loading) return;
     const grid = this.root.querySelector('#assetGrid');
     const empty = this.root.querySelector('#astEmpty');
     if (!grid) return;
@@ -423,7 +434,7 @@ const AssetsView = {
       btn.addEventListener('click', e => { e.stopPropagation(); this.shareAsset(btn.dataset.id); });
     });
     renderPager(this.root.querySelector('#astPager'), {
-      page: this.state.page,
+      page: this.state.page, pageSize: this.state.size,
       total: this.state.total != null ? this.state.total : this.state.assets.length,
       onPage: p => this.gotoPage(p)
     });
@@ -670,6 +681,6 @@ const AssetsView = {
         view.loadAndRender();
       }
     });
-    openModal({ title: '上传素材', body: dz, size: '' });
+    openModal({ title: '上传资产', body: dz, size: '' });
   }
 };

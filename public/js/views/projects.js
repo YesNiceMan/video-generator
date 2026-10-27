@@ -153,22 +153,22 @@ const ProjectsView = {
   async editProjectDialog(projectId) {
     const p = this.state.projects.find(x => x.id === projectId);
     if (!p) return toast('项目不存在', 'err');
-    const vals = await formModal({
+    await formModal({
       title: `${icon('pencil', 'ico-sm')} 编辑项目 · ${esc(p.name)}`,
       fields: [
         { key: 'name', label: '项目名称', value: p.name, placeholder: '如： 《山海录》第一季' },
         { key: 'description', label: '项目描述', type: 'textarea', value: p.description || '', placeholder: '选填' }
       ],
-      submitText: '保存修改'
+      submitText: '保存修改',
+      onSubmit: async (vals) => {
+        await API.patch('/projects/' + projectId, { name: vals.name, description: vals.description });
+        toast('项目已更新', 'ok');
+        if (window.App && App.refreshProjects) App.refreshProjects();
+        const res = await API.get('/projects');
+        this.state.projects = res.items;
+        this.renderList();
+      }
     });
-    if (vals) {
-      await API.patch('/projects/' + projectId, { name: vals.name, description: vals.description });
-      toast('项目已更新', 'ok');
-      if (window.App && App.refreshProjects) App.refreshProjects();
-      const res = await API.get('/projects');
-      this.state.projects = res.items;
-      this.renderList();
-    }
   },
 
   /* 删除自己创建的项目(终态确认) */
@@ -260,7 +260,7 @@ const ProjectsView = {
     const ratioLabel = r => (VIDEO_RATIOS.find(x => x.v === r) || {}).t || r;
     const fpsLabel = f => (COMMON_FPS.find(o => Number(o.v) === Number(f)) || {}).t || (f + ' fps');
     const durOpts = Array.from({ length: 13 }, (_, i) => i + 3).map(d => ({ value: String(d), label: d === 10 ? '10s · 默认' : d + 's' }));
-    const vals = await formModal({
+    await formModal({
       title: '新建项目',
       size: 'modal-md',
       fields: [
@@ -276,14 +276,14 @@ const ProjectsView = {
         { key: 'shot_duration', label: '单镜默认时长', type: 'select', value: '10', options: durOpts,
           hint: '新增分镜的初始时长与帧率/画幅都会带上;进入分镜后仍可逐镜调整' }
       ],
-      submitText: '创建'
+      submitText: '创建',
+      onSubmit: async (vals) => {
+        const { project } = await API.post('/projects', vals);
+        toast(`项目已创建 · 出片规格 ${project.resolution || '720p'} / ${project.aspect_ratio || '16:9'} / ${project.fps || 30}fps`, 'ok');
+        if (window.App && App.refreshProjects) App.refreshProjects();
+        location.hash = '#/projects/' + project.id;
+      }
     });
-    if (vals) {
-      const { project } = await API.post('/projects', vals);
-      toast(`项目已创建 · 出片规格 ${project.resolution || '720p'} / ${project.aspect_ratio || '16:9'} / ${project.fps || 30}fps`, 'ok');
-      if (window.App && App.refreshProjects) App.refreshProjects();
-      location.hash = '#/projects/' + project.id;
-    }
   },
 
   /* ---------- 项目详情(漫剧创作工作台) ---------- */
@@ -305,21 +305,24 @@ const ProjectsView = {
   studio: null,
 
   async renderEpisodeStudio(projectId, episodeId) {
-    const [projRes, modelsRes, stylesRes, assetsRes, stateRes, cfgRes] = await Promise.all([
+    const [projRes, modelsRes, stylesRes, assetsRes, stateRes, cfgRes, textRes] = await Promise.all([
       API.get('/projects/' + projectId),
       API.get('/styles/models'),
       API.get('/styles'),
       API.get('/assets?type=all'), /* 不再限定根目录：全部资产(含子文件夹)都可链接/引用 */
       API.get('/episodes/' + episodeId + '/studio').catch(() => ({ state: null, saved_at: null })),
       /* 第二十轮：生成视频尺寸由后台「系统设置 → 生成视频尺寸」下发(480p/720p/960p/2k 勾选) */
-      API.get('/config').catch(() => null)
+      API.get('/config').catch(() => null),
+      /* 第四十二轮：文本处理模型与任务清单(剧本 AI 工具条的唯一依据) */
+      API.get('/text/models').catch(() => ({ items: [], tasks: [] }))
     ]);
     const project = projRes.project;
     const episode = project.episodes.find(e => e.id === episodeId);
     if (!episode) { toast('分集不存在', 'err'); location.hash = '#/projects/' + projectId; return; }
     this.state.project = project; // 供 settingsDialog / exportDialog 复用
-    /* 第二十五轮：生图模型(text-to-image)不进视频模型下拉，单列 imgModels 供「AI 生图」使用 */
-    const models = modelsRes.items.filter(m => m.enabled !== 0 && m.type !== 'text-to-image');
+    /* 第二十五轮：生图模型(text-to-image)不进视频模型下拉，单列 imgModels 供「AI 生图」使用
+       第四十二轮：文本模型同样不参与视频生成 */
+    const models = modelsRes.items.filter(m => m.enabled !== 0 && m.type !== 'text-to-image' && m.type !== 'text-generation');
     const imgModels = modelsRes.items.filter(m => m.enabled !== 0 && m.type === 'text-to-image');
     /* 后台下发的生成尺寸白名单与默认档(接口异常时用兜底值) */
     const resolutions = (cfgRes && Array.isArray(cfgRes.videoResolutions) && cfgRes.videoResolutions.length)
@@ -343,6 +346,10 @@ const ProjectsView = {
       resolutions, defaultResolution, spec,
       /* 第二十五轮：生图每张积分(供快捷生图弹窗计价展示) */
       imgPrice: (cfgRes && cfgRes.creditPerImage != null) ? cfgRes.creditPerImage : 2,
+      /* 第四十二轮：文本模型 / 可用处理任务 / 文本每次积分(剧本 AI 工具条) */
+      textModels: (textRes && textRes.items) || [], textTasks: (textRes && textRes.tasks) || [],
+      textDefaultModel: (textRes && textRes.defaultModelId) || '',
+      textPrice: (cfgRes && cfgRes.creditPerText != null) ? cfgRes.creditPerText : 1,
       taskSig: '', pollTimer: null, uidSeed: 0,
       renderedOnce: false, dirty: false, saveTimer: null
     };
@@ -615,9 +622,10 @@ const ProjectsView = {
       <span class="mbar-hint">${icon('keyboard', 'ico-xs')} Ctrl+Enter 快速生成</span>
       <span class="ctx-spacer"></span>
       <button class="ws-tbtn" data-ws-action="script" title="编辑本集剧本文案">${icon('file-text', 'ico-xs')}<span>录入原文</span></button>
+      <button class="ws-tbtn" data-ws-action="aisplit" title="AI 拆成分镜：按本集原文批量生成分镜卡">${icon('scissors', 'ico-xs')}<span>AI 拆分镜</span></button>
       <button class="ws-tbtn" data-ws-action="review" title="查看本集全部生成任务">${icon('clapperboard', 'ico-xs')}<span>批量审片</span></button>
       <button class="ws-tbtn" data-ws-action="log" title="查看提交记录与异常">${icon('scroll-text', 'ico-xs')}<span>工作日志</span></button>
-      <button class="ws-tbtn" data-ws-action="supply" title="上传素材入库">${icon('upload', 'ico-xs')}<span>补给资产</span></button>
+      <button class="ws-tbtn" data-ws-action="supply" title="上传资产入库">${icon('upload', 'ico-xs')}<span>补给资产</span></button>
       <button class="ws-tbtn" data-ws-action="aiimg" title="AI 生图：生成图片并入参考资产">${icon('image-plus', 'ico-xs')}<span>AI 生图</span></button>
       <span class="filters-divider"></span>
       <button class="ws-tbtn" data-ws-action="reccollapse" title="折叠/展开全部生成记录(进行中的任务保持展开)">${s.recsCollapsed ? icon('eye', 'ico-xs') + '<span>展开记录</span>' : icon('eye-off', 'ico-xs') + '<span>折叠记录</span>'}</button>
@@ -800,7 +808,12 @@ const ProjectsView = {
       </button>
     </aside>
     <main class="ws-main">
-      ${s.shots.map(sh => this.shotCardHTML(sh)).join('')}
+      ${s.shots.length ? s.shots.map(sh => this.shotCardHTML(sh)).join('') : `
+        <div class="empty">
+          <div class="empty-ico">${icon('clapperboard')}</div>
+          <h3>本集还没有分镜</h3>
+          <p>点下方「追加新分镜」逐个建镜，或用工具栏「AI 拆分镜」按剧本批量生成</p>
+        </div>`}
     </main>`;
   },
 
@@ -854,7 +867,7 @@ const ProjectsView = {
     const idx = s.shots.indexOf(sh);
     const collapsed = !!sh.collapsed;
     const first = idx === 0, last = idx === s.shots.length - 1;
-    const modelOpts = s.models.map(m => `<option value="${m.id}" ${sh.modelId === m.id ? 'selected' : ''}>${esc(m.name)} (${esc(m.version)})</option>`).join('');
+    const modelOpts = s.models.map(m => `<option value="${m.id}" ${sh.modelId === m.id ? 'selected' : ''}>${esc(modelOptionLabel(m))} (${esc(m.version)})</option>`).join('');
     const styleOpts = '<option value="">不套用风格</option>' + s.styles.map(st => `<option value="${st.id}" ${sh.styleId === st.id ? 'selected' : ''}>${esc(st.name)}</option>`).join('');
     const toggleIco = collapsed ? 'chevrons-down-up' : 'chevrons-up-down';
     const toggleTitle = collapsed ? '展开该分镜' : '折叠该分镜';
@@ -918,7 +931,9 @@ const ProjectsView = {
           </div>
         </aside>
         <section class="ws-shot-editor">
-          <div class="ws-editor-cap">${icon('pen-line', 'ico-xs')}剧本文案<span>输入 [资产名] 自动链接左侧参考资产</span></div>
+          <div class="ws-editor-cap">${icon('pen-line', 'ico-xs')}剧本文案<span>输入 [资产名] 自动链接左侧参考资产</span>
+            <button class="ws-icon-btn ws-cap-ai" data-shot-aitext="${sh.key}" title="AI 处理这段文案：润色 / 扩写 / 精简 / 转成视频提示词">${icon('sparkles', 'ico-xs')}<span>AI 改写</span></button>
+          </div>
           <div class="ws-script-wrap">
             <textarea class="ws-script" data-shot-script="${sh.key}" placeholder="输入剧本文案，支持 [资产名] 占位符自动链接左侧参考资产（如 [女主]），成功后金色高亮…&#10;Ctrl + Enter 快速提交生成">${esc(sh.script)}</textarea>
           </div>
@@ -1022,7 +1037,7 @@ const ProjectsView = {
         ? `<div class="ws-rec-progress"><div class="ws-rec-bar"><i style="width:${t.progress}%"></i></div><span data-wait-until="${t.next_at}">${waitSec}s 后重试</span></div>`
         : `<div class="ws-rec-progress"><div class="ws-rec-bar"><i style="width:${t.progress}%"></i></div><span>${t.progress}%</span></div>`;
     } else {
-      media = `<div class="ws-rec-fail">${esc(t.error || (t.status === 'cancelled' ? '已取消' : '失败'))}</div>`;
+      media = `<div class="ws-rec-fail" title="${esc(t.error || '')}">${esc(errBrief(t.error) || (t.status === 'cancelled' ? '已取消' : '失败'))}</div>`;
     }
     const canDelete = ['completed', 'failed', 'cancelled'].includes(t.status);
     const actions = (isCompleted
@@ -1143,6 +1158,9 @@ const ProjectsView = {
       /* 第二十五轮：分镜快捷「AI 生图」→ 生成图自动加入参考资产 */
       const igBtn = e.target.closest('[data-shot-imggen]');
       if (igBtn) { const sh = this.getShot(igBtn.dataset.shotImggen); if (sh) this.aiImageDialog(sh); return; }
+      /* 第四十二轮：分镜剧本的 AI 改写菜单(润色/扩写/精简/转视频提示词/撤销) */
+      const at = e.target.closest('[data-shot-aitext]');
+      if (at) { const sh = this.getShot(at.dataset.shotAitext); if (sh) this.aiTextMenu(sh, e, at); return; }
       const tr = e.target.closest('[data-task-retry]');
       if (tr) { await this.retryTask(tr.dataset.taskRetry); return; }
       const tc = e.target.closest('[data-task-cancel]');
@@ -1257,10 +1275,142 @@ const ProjectsView = {
     this.markDirty();
   },
 
+  /* ---------- 第四十二轮：文本模型驱动的剧本处理 ---------- */
+  /* 当前用哪个文本模型：本机记住的选择 > 管理员默认 > 列表第一个。
+     存 localStorage 而不是改系统设置：普通用户也能换，且不会动别人的默认。 */
+  textModelId() {
+    const s = this.studio || {};
+    const ids = (s.textModels || []).map(m => m.id);
+    let saved = '';
+    try { saved = localStorage.getItem('vf-text-model') || ''; } catch (e) { }
+    if (saved && ids.includes(saved)) return saved;
+    if (s.textDefaultModel && ids.includes(s.textDefaultModel)) return s.textDefaultModel;
+    return ids[0] || '';
+  },
+  textModel() {
+    const id = this.textModelId();
+    return (((this.studio || {}).textModels) || []).find(m => m.id === id) || null;
+  },
+  setTextModel(id) {
+    try { localStorage.setItem('vf-text-model', id); } catch (e) { }
+    const m = this.textModel();
+    toast('AI 改写改用「' + ((m && m.name) || id) + '」', 'ok');
+  },
+  requireTextModel() {
+    const m = this.textModel();
+    if (!m) toast('还没有可用的文本模型：请到「后台管理 → 模型管理」添加，类型选「文本处理」', 'err', 5000);
+    return m;
+  },
+  textPriceNote(m) {
+    if (!m) return '';
+    return m.is_free ? '免费' : ((m.price_per_call != null ? m.price_per_call : (this.studio.textPrice || 1)) + ' 积分/次');
+  },
+  /* 一次文本调用:期间锁住所有 AI 按钮,避免连点重复计费 */
+  async runText(task, text) {
+    const lock = this.root ? Array.from(this.root.querySelectorAll('[data-shot-aitext],[data-ws-action="aisplit"]')) : [];
+    lock.forEach(b => { b.disabled = true; b.classList.add('is-busy'); });
+    try {
+      const id = this.textModelId();
+      return await API.post('/text/complete', { task, text, model_id: id || undefined });
+    } finally {
+      lock.forEach(b => { b.disabled = false; b.classList.remove('is-busy'); });
+    }
+  },
+  aiTextMenu(sh, e, anchor) {
+    if (!this.requireTextModel()) return;
+    const s = this.studio;
+    const cur = this.textModelId();
+    const items = (s.textTasks || []).filter(t => !t.json).map(t => ({
+      icon: 'sparkles',
+      label: t.label + '（' + this.textPriceNote(this.textModel()) + '）',
+      onClick: () => this.applyTextToShot(sh, t)
+    }));
+    if (!items.length) return toast('后台没有开放任何文本处理类型', 'err');
+    if (sh.scriptUndo) {
+      items.push({ sep: true });
+      items.push({ icon: 'undo-2', label: '撤销上一次 AI 改写', onClick: () => this.undoText(sh) });
+    }
+    /* 模型切换:菜单底部直接换,不用去系统设置 */
+    if ((s.textModels || []).length > 1) {
+      items.push({ sep: true });
+      for (const m of s.textModels) {
+        items.push({
+          icon: m.id === cur ? 'check' : 'cpu',
+          label: m.name + ' · ' + this.textPriceNote(m) + (m.id === cur ? '（当前）' : ''),
+          disabled: m.id === cur,
+          onClick: () => this.setTextModel(m.id)
+        });
+      }
+    }
+    contextMenu(e, items);
+  },
+  async applyTextToShot(sh, t) {
+    const text = String(sh.script || '').trim();
+    if (!text) return toast('这个分镜还没有剧本文案', 'err');
+    if (!this.requireTextModel()) return;
+    toast(t.label + '中…', 'info', 2000);
+    try {
+      const r = await this.runText(t.id, text);
+      if (!r || !r.result || typeof r.result.text !== 'string') throw new Error('模型没有返回文本');
+      sh.scriptUndo = text;
+      sh.script = r.result.text;
+      const ta = this.root.querySelector('[data-shot-script="' + sh.key + '"]');
+      if (ta) ta.value = sh.script;
+      this.markDirty();
+      toast(t.label + '完成 · ' + (r.credits && r.credits.cost ? '扣 ' + r.credits.cost + ' 积分' : '未扣积分'), 'ok');
+    } catch (e) {
+      toast(e.message || '文本处理失败', 'err', 6000);
+    }
+  },
+  undoText(sh) {
+    if (!sh.scriptUndo) return;
+    const prev = sh.scriptUndo;
+    delete sh.scriptUndo;
+    sh.script = prev;
+    const ta = this.root.querySelector('[data-shot-script="' + sh.key + '"]');
+    if (ta) ta.value = prev;
+    this.markDirty();
+    toast('已还原 AI 改写前的文案', 'ok');
+  },
+  /* 按本集原文批量生成分镜卡(只追加，不覆盖已有分镜) */
+  async aiSplitShots(btn) {
+    const s = this.studio;
+    const src = String((s.episode && s.episode.script) || '').trim();
+    if (!src) { toast('先用「录入原文」粘贴本集剧本，再拆分成镜', 'err', 5000); return; }
+    const m = this.requireTextModel();
+    if (!m) return;
+    const ok = await confirmDlg(
+      '将按本集原文（' + src.length + ' 字）调用文本模型拆成分镜卡，追加在现有 ' + s.shots.length + ' 个分镜之后。'
+      + '模型：' + m.name + ' · 费用：' + this.textPriceNote(m) + '。想换模型可在分镜的「AI 改写」菜单底部切换。',
+      { title: 'AI 拆分镜', danger: false, okText: '开始拆分' });
+    if (!ok) return;
+    if (btn) btn.disabled = true;
+    try {
+      const r = await this.runText('split_shots', src);
+      const shots = (r && r.result && r.result.shots) || [];
+      if (!shots.length) throw new Error('模型没有返回可用镜头');
+      for (const x of shots) {
+        const sh = this.newShot(s.shots.length + 1);
+        sh.title = x.title;
+        sh.script = x.script;
+        sh.duration = x.duration;
+        s.shots.push(sh);
+      }
+      this.markDirty();
+      this.renderStudioBody();
+      toast('已拆出 ' + shots.length + ' 个分镜（原文案与已有分镜未动）', 'ok', 5000);
+    } catch (e) {
+      toast(e.message || '拆分镜失败', 'err', 6000);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  },
+
   /* ---------- 顶部工具栏动作 ---------- */
   async wsAction(action, btn) {
     switch (action) {
       case 'script': return this.episodeScriptDialog();
+      case 'aisplit': return this.aiSplitShots(btn);
       case 'review': return this.reviewDialog();
       case 'log': return this.workLogDialog();
       case 'supply': return this.supplyAssets();
@@ -1280,13 +1430,13 @@ const ProjectsView = {
     const vals = await formModal({
       title: `${icon('file-text', 'ico-sm')} 录入原文 · ${esc(s.episode.title)}`,
       fields: [{ key: 'script', label: '分集原文(剧本)', type: 'textarea', value: s.episode.script || '', placeholder: '粘贴本集的剧本原文，用于分镜拆解与视频生成…' }],
-      submitText: '保存原文'
+      submitText: '保存原文',
+      onSubmit: async (vals) => {
+        await API.patch('/episodes/' + s.episode.id, { script: vals.script });
+        s.episode.script = vals.script;
+        toast('原文已保存', 'ok');
+      }
     });
-    if (vals) {
-      await API.patch('/episodes/' + s.episode.id, { script: vals.script });
-      s.episode.script = vals.script;
-      toast('原文已保存', 'ok');
-    }
   },
 
   /* 批量审片：该分集全部生成任务 */
@@ -1378,7 +1528,7 @@ const ProjectsView = {
       list.innerHTML = shown.map(function(t) {
         var model = _s.models.find(function(m) { return m.id === t.model_id; });
         var normal = isNormal(t);
-        var errTxt = t.status === 'failed' && t.error ? ' · ' + esc(String(t.error).slice(0, 80)) : '';
+        var errTxt = t.status === 'failed' && t.error ? ' · ' + esc(errBrief(t.error, 60)) : '';
         // 详细信息
         var detailRows = '';
         if (t.params) {
@@ -1486,7 +1636,7 @@ const ProjectsView = {
   /* 补给资产：上传素材入库 */
   supplyAssets() {
     const dz = makeDropzone({
-      text: '点击或拖拽上传图片 / 视频 / 音频素材', multiple: true,
+      text: '点击或拖拽上传图片 / 视频 / 音频', multiple: true,
       onFiles: async files => {
         const m = openModal({ title: '上传中…', body: '<div class="loading-wrap"><span class="spinner"></span></div>', size: 'modal-sm' });
         let ok = 0;
@@ -1495,7 +1645,7 @@ const ProjectsView = {
           catch (e) { toast(e.message, 'err'); }
         }
         m.close();
-        toast('已上传 ' + ok + ' 个素材', 'ok');
+        toast('已上传 ' + ok + ' 个资产', 'ok');
       }
     });
     openModal({ title: `${icon('zap', 'ico-sm')} 补给资产`, body: dz });
@@ -1521,7 +1671,7 @@ const ProjectsView = {
     body.innerHTML = `
       <div class="alib-toolbar">
         <div class="search-box" style="flex:0 1 240px">
-          ${icon('search', 'search-ico')}<input class="input" id="alpSearch" placeholder="搜索素材名称…">
+          ${icon('search', 'search-ico')}<input class="input" id="alpSearch" placeholder="搜索资产名称…">
         </div>
         <select class="select" id="alpType" style="width:auto">
           <option value="all">全部类型</option>
@@ -1531,7 +1681,7 @@ const ProjectsView = {
         </select>
         <span class="alib-count" id="alpCount"></span>
         <span class="grow"></span>
-        <button class="btn btn-sm" id="alpUpload">${iconText('upload', '上传素材')}</button>
+        <button class="btn btn-sm" id="alpUpload">${iconText('upload', '上传资产')}</button>
       </div>
       <div class="cat-chips" id="alpCats"></div>
       <div class="alib-body">
@@ -1541,7 +1691,7 @@ const ProjectsView = {
         </div>
         <div class="alib-main">
           <div class="grid grid-cards" id="alpGrid"></div>
-          <div id="alpEmpty" class="hidden empty"><div class="empty-ico">${icon('folder-open')}</div><h3>暂无资产</h3><p>点击「上传素材」或从其他分类导入</p></div>
+          <div id="alpEmpty" class="hidden empty"><div class="empty-ico">${icon('folder-open')}</div><h3>暂无资产</h3><p>点击「上传资产」或从其他分类导入</p></div>
         </div>
       </div>
       <div id="alpPager"></div>`;
@@ -1604,7 +1754,7 @@ const ProjectsView = {
     };
 
     const updateCount = list => {
-      countBox.innerHTML = '共 <b class="gold-num">' + list.length + '</b> 项素材' + (multi ? ' · 已选 <b class="gold-num">' + sel.size + '</b> 项' : '');
+      countBox.innerHTML = '共 <b class="gold-num">' + list.length + '</b> 项资产' + (multi ? ' · 已选 <b class="gold-num">' + sel.size + '</b> 项' : '');
       if (okBtn) { okBtn.disabled = sel.size === 0; okBtn.innerHTML = iconText('check', '导入选中 (' + sel.size + ')'); }
     };
 
@@ -1646,7 +1796,7 @@ const ProjectsView = {
 
     body.querySelector('#alpUpload').addEventListener('click', () => {
       const dz = makeDropzone({
-        text: '点击或拖拽上传图片 / 视频 / 音频素材', multiple: true,
+        text: '点击或拖拽上传图片 / 视频 / 音频', multiple: true,
         onFiles: async files => {
           const up = openModal({ title: '上传中…', body: '<div class="loading-wrap"><span class="spinner"></span></div>', size: 'modal-sm' });
           let okN = 0;
@@ -1655,14 +1805,14 @@ const ProjectsView = {
             catch (e) { toast(e.message, 'err'); }
           }
           up.close();
-          toast('已上传 ' + okN + ' 个素材', 'ok');
+          toast('已上传 ' + okN + ' 个资产', 'ok');
           const res = await API.get('/assets?type=all');
           all = res.items || [];
           pickPage = 1;
           renderFolders(); renderCats(); renderGrid();
         }
       });
-      openModal({ title: icon('zap', 'ico-sm') + ' 上传素材', body: dz });
+      openModal({ title: icon('zap', 'ico-sm') + ' 上传资产', body: dz });
     });
 
     const cancelBtn = el('<button class="btn">取消</button>');
@@ -1673,7 +1823,7 @@ const ProjectsView = {
       cancelBtn.addEventListener('click', () => m.close());
       okBtn.addEventListener('click', () => {
         const picked = all.filter(a => sel.has(a.id));
-        if (!picked.length) return toast('请先选择素材', 'err');
+        if (!picked.length) return toast('请先选择资产', 'err');
         m.close();
         if (onPick) onPick(picked);
       });
@@ -1723,8 +1873,8 @@ const ProjectsView = {
           if (!s.selRef && a.type === 'image') s.selRef = ref;
           added++;
         }
-        if (!added) return toast('所选素材都已在参考列表中', 'err');
-        toast('已引入 ' + added + ' 项素材', 'ok');
+        if (!added) return toast('所选资产都已在参考列表中', 'err');
+        toast('已引入 ' + added + ' 项资产', 'ok');
         this.markDirty();
         this.flashShots();
         this.renderStudioBody();
@@ -1842,7 +1992,7 @@ const ProjectsView = {
       });
       return;
     }
-    const modelOpts = s.imgModels.map(m => '<option value="' + esc(m.id) + '">' + esc(m.name) + (m.is_free ? '(免费)' : '') + '</option>').join('');
+    const modelOpts = s.imgModels.map(m => '<option value="' + esc(m.id) + '">' + esc(modelOptionLabel(m)) + '</option>').join('');
     /* 第二十六轮：能力 / 参数模板驱动(比例 · 尺寸 · 张数上限 · 多图合成) */
     const capsOf = m => Array.isArray(m && m.caps) && m.caps.length ? m.caps : ['text-to-image'];
     const canRef = m => capsOf(m).includes('image-to-image') || capsOf(m).includes('multi-image');
@@ -1888,7 +2038,8 @@ const ProjectsView = {
     /* 参数行按当前模型参数模板重画(比例 / 分辨率 / 张数；旧模型仅配固定尺寸时显示尺寸) */
     const renderParams = () => {
       const m = curModel();
-      const ratioDef = schemaDef(m, 'ratio');
+      /* 比例清单双键读取:aspect_ratio 为准,兼容早期写的 ratio(与生图页同口径) */
+      const ratioDef = schemaDef(m, 'aspect_ratio') || schemaDef(m, 'ratio');
       const resDef = schemaDef(m, 'resolution');
       const sizeDef = schemaDef(m, 'size');
       /* 项目设的画幅比例优先(26·5):分镜生图的构图与成片画幅保持一致 */
@@ -2076,7 +2227,7 @@ const ProjectsView = {
           }
           if (!t || t.status === 'queued' || t.status === 'processing') continue;
           st._igWatchIds.delete(tid);
-          if (t.status !== 'completed') { toast('生图任务失败：' + (t.error || t.status), 'err'); continue; }
+          if (t.status !== 'completed') { toast('生图任务失败：' + (errBrief(t.error) || t.status), 'err'); continue; }
           let added = 0;
           for (const a of (t.result_assets || [])) {
             if (st.refs.some(r => r.id === a.id)) continue;
@@ -2350,7 +2501,7 @@ const ProjectsView = {
         <span class="wb-go">${icon('arrow-right')}</span>
         <div class="wb-ic">${icon('film')}</div>
         <div class="wb-card-title">全剧资产库</div>
-        <div class="wb-card-sub">角色 · 场景 · 道具素材统一管理</div>
+        <div class="wb-card-sub">角色 · 场景 · 道具资产统一管理</div>
         <div class="wb-assets-strip">
           ${strip.map(a => `<img src="/api/assets/${a.id}/file" alt="">`).join('')}
           ${assets.length > strip.length ? `<span class="wb-assets-more">+${assets.length - strip.length}</span>` : ''}
@@ -2518,13 +2669,15 @@ const ProjectsView = {
         try { await navigator.clipboard.writeText(p.code || ''); toast('邀请码已复制', 'ok'); }
         catch (e) { toast('邀请码：' + p.code, 'ok'); }
       });
-      body.querySelector('#rotateCodeBtn').addEventListener('click', async () => {
+      body.querySelector('#rotateCodeBtn').addEventListener('click', async (e) => {
+        if (!await confirmDlg('确认重置邀请码？旧邀请码会立即失效，已拿到旧码的人将无法加入。')) return;
+        e.target.disabled = true;
         try {
           const { project } = await API.patch('/projects/' + p.id, { rotate_code: true });
           this.state.project.code = project.code;
           toast('邀请码已重置：' + project.code, 'ok');
           m.close(); this.settingsDialog();
-        } catch (e) { toast(e.message, 'err'); }
+        } catch (e) { toast(e.message, 'err'); e.target.disabled = false; }
       });
       API.get('/projects/' + p.id + '/members').then(res => {
         const box = body.querySelector('#memberList');
@@ -2614,27 +2767,29 @@ const ProjectsView = {
   /* ---------- 分集操作 ---------- */
   async addEpisodeDialog() {
     const p = this.state.project;
-    const vals = await formModal({
+    await formModal({
       title: '新建分集',
       fields: [{ key: 'title', label: '分集标题', placeholder: '如： 第 05 集 · 转折', value: '第 ' + (p.episodes.length + 1) + ' 集' }],
-      submitText: '创建'
+      submitText: '创建',
+      onSubmit: async (vals) => {
+        await API.post('/projects/' + p.id + '/episodes', vals);
+        toast('分集已创建', 'ok');
+        this.renderDetail(p.id);
+      }
     });
-    if (vals) {
-      await API.post('/projects/' + p.id + '/episodes', vals);
-      toast('分集已创建', 'ok');
-      this.renderDetail(p.id);
-    }
   },
 
   async renameEpisodeDialog(epId) {
     const ep = this.state.project.episodes.find(e => e.id === epId);
     if (!ep) return;
-    const vals = await formModal({ title: '重命名分集', fields: [{ key: 'title', label: '分集标题', value: ep.title }], submitText: '保存' });
-    if (vals) {
-      await API.patch('/episodes/' + epId, { title: vals.title });
-      toast('已保存', 'ok');
-      this.renderDetail(this.state.project.id);
-    }
+    await formModal({
+      title: '重命名分集', fields: [{ key: 'title', label: '分集标题', value: ep.title }], submitText: '保存',
+      onSubmit: async (vals) => {
+        await API.patch('/episodes/' + epId, { title: vals.title });
+        toast('已保存', 'ok');
+        this.renderDetail(this.state.project.id);
+      }
+    });
   },
 
   async deleteEpisode(epId) {
@@ -2650,19 +2805,19 @@ const ProjectsView = {
     const ep = this.state.project.episodes.find(e => e.id === epId);
     if (!ep) return;
     const num = String(ep.order_index + 1).padStart(2, '0');
-    const vals = await formModal({
+    await formModal({
       title: `${icon('pen-line', 'ico-sm')} 剧本录入 · 第 ${num} 集`,
       fields: [{
         key: 'script', label: '分集剧本', type: 'textarea', value: ep.script || '',
         placeholder: '编写本集的剧情梗概、关键台词与分镜提示…'
       }],
-      submitText: '保存剧本'
+      submitText: '保存剧本',
+      onSubmit: async (vals) => {
+        await API.patch('/episodes/' + epId, { script: vals.script });
+        toast('剧本已保存', 'ok');
+        this.renderDetail(this.state.project.id);
+      }
     });
-    if (vals) {
-      await API.patch('/episodes/' + epId, { script: vals.script });
-      toast('剧本已保存', 'ok');
-      this.renderDetail(this.state.project.id);
-    }
   },
 
   /* AI 分集创作(本地模拟：剧情方向 → 新分集) */

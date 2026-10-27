@@ -41,7 +41,12 @@ const ImagesView = {
   canRef(m) { const c = this.capsOf(m); return c.includes('image-to-image') || c.includes('multi-image'); },
   canMulti(m) { return this.capsOf(m).includes('multi-image'); },
   schemaDef(m, key) { const s = Array.isArray(m && m.params_schema) ? m.params_schema : []; return s.find(d => d && d.key === key) || null; },
-  ratioDef(m) { const d = this.schemaDef(m, 'ratio'); return d && Array.isArray(d.options) && d.options.length ? d : null; },
+  /* 画幅比例清单:键名以 aspect_ratio 为准(后台编辑器与视频侧、服务端都用它),
+     同时兼容早期的 ratio —— 只认一个键会让用另一键建模的模型在生图页丢掉比例下拉 */
+  ratioDef(m) {
+    const d = this.schemaDef(m, 'aspect_ratio') || this.schemaDef(m, 'ratio');
+    return d && Array.isArray(d.options) && d.options.length ? d : null;
+  },
   sizeDef(m) { const d = this.schemaDef(m, 'size'); return d && Array.isArray(d.options) && d.options.length ? d : null; },
   resDef(m) { const d = this.schemaDef(m, 'resolution'); return d && Array.isArray(d.options) && d.options.length ? d : null; },
   qualityDef(m) { const d = this.schemaDef(m, 'quality'); return d && Array.isArray(d.options) && d.options.length ? d : null; },
@@ -146,7 +151,7 @@ const ImagesView = {
     html += '<div class="form-sect">模型</div>';
     html += '<div class="form-row">';
     html += '<div class="field ig-f-model"><label>生图模型</label><select class="select" id="igModel">';
-    html += st.models.map(mm => '<option value="' + esc(mm.id) + '"' + (mm.id === model.id ? ' selected' : '') + '>' + esc(mm.name) + (mm.is_free ? '(免费)' : '') + '</option>').join('');
+    html += st.models.map(mm => '<option value="' + esc(mm.id) + '"' + (mm.id === model.id ? ' selected' : '') + '>' + esc(modelOptionLabel(mm)) + '</option>').join('');
     html += '</select><div class="hint" id="igModelHint"></div></div>';
     html += '<div class="field"><label>风格(可选)</label><select class="select" id="igStyle">' + styleOpts + '</select></div>';
     html += '</div>';
@@ -197,10 +202,14 @@ const ImagesView = {
     const updateModelHint = () => {
       const hint = q('#igModelHint');
       if (!hint) return;
+      const fq = freeQuotaText(model);
       hint.textContent = model.is_free
-        ? '免费模型 · 不消耗积分'
+        ? '免费模型 · 不消耗积分' + (fq ? ' · 额度' + fq + '(平台内已用 ' + model.free_quota.used + (model.free_quota.unit_text || '') + ')' : '')
         : (model.api_base ? '在线 API 模型 · ' + this.priceOf(model) + ' 积分/张' : '本地模型 · ' + this.priceOf(model) + ' 积分/张');
-      if (model.api_base && !model.has_api_key) hint.textContent = '⚠ 管理员还未配置该模型的 API Key,暂不可用';
+      if (model.is_free && model.free_quota && model.free_quota.exhausted) {
+        hint.innerHTML = icon('triangle-alert') + ' 平台内已消耗满登记额度(' + esc(model.free_quota.total) + esc(model.free_quota.unit_text || '') + ')，继续提交可能被服务商拒绝';
+      }
+      if (model.api_base && !model.has_api_key) hint.innerHTML = icon('triangle-alert') + ' 管理员还未配置该模型的 API Key,暂不可用';
     };
     const updateCost = () => {
       const el2 = q('#igCost');
@@ -503,10 +512,13 @@ const ImagesView = {
     if (silent && !st.tasks.length) return;
     const done = st.tasks.filter(t => t.status === 'completed').length;
     const filtered = this.visibleTasks();
-    /* 26·1:生成记录同样每页 20 条(演示账号 50+ 条时右栏一度拉到 3700px 高) */
-    const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+    /* 26·1:生成记录分页(演示账号 50+ 条时右栏一度拉到 3700px 高);
+       32·需求三十一续:每页 = 列数 × 4 行,整数行,最后一行不空格 */
+    const size = gridPageSize(wrap, '--ig-card-min', PAGE_SIZE);
+    st.rsize = size;
+    const pages = Math.max(1, Math.ceil(filtered.length / size));
     st.rpage = Math.min(Math.max(1, st.rpage || 1), pages);
-    const shown = filtered.slice((st.rpage - 1) * PAGE_SIZE, (st.rpage - 1) * PAGE_SIZE + PAGE_SIZE);
+    const shown = filtered.slice((st.rpage - 1) * size, (st.rpage - 1) * size + size);
     let html = '<div class="ig-res-head">';
     html += '<div class="ig-res-title">' + icon('images', 'ico-sm') + ' 生成记录 <b>' + st.tasks.length + '</b>';
     html += active ? '<i class="ig-res-run">' + active + ' 进行中</i>' : '';
@@ -523,8 +535,9 @@ const ImagesView = {
     html += shown.length ? shown.map(t => this.taskCardHTML(t)).join('')
       : '<div class="empty" style="grid-column:1/-1;padding:44px 16px"><div class="empty-ico">' + icon('image-plus') + '</div><h3>'
         + (st.tasks.length ? '该筛选下暂无记录' : '还没有生成记录') + '</h3><p style="font-size:13px;color:var(--ink-2)">在左侧输入提示词，点击「开始生图」试试</p></div>';
-    html += '</div>';
-    html += '<div id="igResPager"></div></div>';
+    html += '</div></div>';
+    /* 分页条放在滚动区之外:sticky 在栏内会在浏览中间行时压住一整排卡片 */
+    html += '<div id="igResPager" class="ig-res-foot"></div>';
     wrap.innerHTML = html;
     wrap.querySelectorAll('[data-ig-filter]').forEach(btn => btn.addEventListener('click', () => {
       st.filter = btn.dataset.igFilter;
@@ -532,7 +545,7 @@ const ImagesView = {
       this.renderResults(root, false);
     }));
     renderPager(wrap.querySelector('#igResPager'), {
-      page: st.rpage, total: filtered.length,
+      page: st.rpage, pageSize: st.rsize, total: filtered.length,
       onPage: p => { st.rpage = p; this.renderResults(root, false); }
     });
     wrap.querySelectorAll('[data-ig-task]').forEach(cardEl => this.bindTaskCard(cardEl));
@@ -563,44 +576,50 @@ const ImagesView = {
 
   taskCardHTML(t) {
     const model = this.state.models.find(m => m.id === t.model_id);
+    const assets = t.result_assets || [];
     let media;
-    if (t.status === 'completed' && (t.result_assets || []).length) {
-      /* 单元格按图片真实宽高比呈现:此前一律 1:1 裁切,换了画幅比例也看不出差别 */
-      media = '<div class="ig-card-imgs">' + t.result_assets.map(a =>
-        '<div class="ig-img-cell" data-ig-view="' + esc(t.id) + '" data-ig-asset="' + esc(a.id) + '" title="点击放大查看(← → 翻页)"'
-        + (a.width && a.height ? ' style="aspect-ratio:' + Number(a.width) + ' / ' + Number(a.height) + '"' : '') + '>'
+    if (t.status === 'completed' && assets.length) {
+      /* 媒体框定高 + cover 裁切:画幅比例改由角标/参数行说明,不再让每张卡按真实比例撑高
+         (原来同一行里媒体高度差到 109px,短图卡片底部一片死白) */
+      media = '<div class="ig-card-imgs">' + assets.map(a =>
+        '<div class="ig-img-cell" data-ig-view="' + esc(t.id) + '" data-ig-asset="' + esc(a.id) + '" title="点击放大查看(← → 翻页)">'
         + '<img src="' + esc(a.thumb_path || ('/api/assets/' + a.id + '/file')) + '" loading="lazy">'
         + '<button class="ig-img-view" data-ig-view="' + esc(t.id) + '" data-ig-asset="' + esc(a.id) + '" title="放大查看">' + icon('zoom-in', 'ico-xs') + '</button></div>').join('') + '</div>';
     } else if (t.status === 'queued' || t.status === 'processing') {
       media = '<div class="ig-card-progress"><div class="ig-card-bar"><i style="width:' + (t.progress || 2) + '%"></i></div><span>' + (t.progress || 2) + '%</span></div>';
     } else {
-      media = '<div class="ig-card-fail">' + esc(t.error || (t.status === 'cancelled' ? '已取消' : '生成失败')) + '</div>';
+      media = '<div class="ig-card-fail" title="' + esc(t.error || '') + '">' + esc(errBrief(t.error) || (t.status === 'cancelled' ? '已取消' : '生成失败')) + '</div>';
     }
+    /* 状态徽章挪到封面左上角 —— 与资产库卡片的类型角标同一语言,
+       也腾出页脚一整行放带文字的按钮(244px 卡宽下状态+三枚按钮必然折行) */
+    const p = t.params || {};
+    const spec = [p.aspect_ratio, p.resolution ? String(p.resolution).toUpperCase() : '', p.size,
+      p.count > 1 ? p.count + ' 张' : '',
+      p.ref_count ? '参考 ' + p.ref_count + (p.ref_count > 1 ? ' 张合成' : ' 张') : ''].filter(Boolean).join(' · ');
     const canDel = ['completed', 'failed', 'cancelled'].includes(t.status);
-    const refCount = t.params && t.params.ref_count ? t.params.ref_count : 0;
     const actions =
       (t.status === 'completed' && t.result_asset_id
-        ? '<a class="ig-act" href="/api/assets/' + esc(t.result_asset_id) + '/file" download="' + esc('生图-' + t.id.slice(0, 8) + '.png') + '">' + icon('download', 'ico-xs') + '下载</a>'
+        ? '<a class="ig-act" href="/api/assets/' + esc(t.result_asset_id) + '/file" download="' + esc('生图-' + t.id.slice(0, 8) + '.png') + '" title="下载这张图">' + icon('download', 'ico-xs') + '下载</a>'
         : '')
       + (t.status === 'completed'
         ? '<button class="ig-act" data-act="again" title="按相同提示词与参数再生成一批(新任务重新计价)">' + icon('sparkles', 'ico-xs') + '再次生成</button>' : '')
       + (t.status === 'failed' || t.status === 'cancelled'
-        ? '<button class="ig-act" data-act="retry">' + icon('rotate-ccw', 'ico-xs') + '重试</button>' : '')
+        ? '<button class="ig-act" data-act="retry" title="按相同参数重新提交">' + icon('rotate-ccw', 'ico-xs') + '重试</button>' : '')
       + (t.status === 'queued' || t.status === 'processing'
-        ? '<button class="ig-act" data-act="cancel">' + icon('x', 'ico-xs') + '取消</button>' : '')
-      + (canDel ? '<button class="ig-act danger" data-act="del">' + icon('trash-2', 'ico-xs') + '删除</button>' : '');
+        ? '<button class="ig-act" data-act="cancel" title="取消任务并退还积分">' + icon('x', 'ico-xs') + '取消</button>' : '')
+      + (canDel ? '<button class="ig-act danger" data-act="del" title="删除这条记录">' + icon('trash-2', 'ico-xs') + '删除</button>' : '');
     return '<div class="ig-card" data-ig-task="' + esc(t.id) + '">'
-      + media
+      + '<div class="ig-card-media">' + media
+      /* 已完成的卡片不贴角标:一屏六枚同款绿章是噪声;进行中/排队/失败才需要被看见 */
+      +   (t.status === 'completed' ? '' : '<span class="ig-card-flag">' + statusBadge(t.status) + '</span>')
+      +   (assets.length > 1 ? '<span class="ig-card-count">' + assets.length + ' 张</span>' : '')
+      + '</div>'
       + '<div class="ig-card-info">'
       +   '<div class="ig-card-prompt ig-card-prompt-copy" data-ig-copy="' + esc(t.id) + '" title="点击复制完整提示词">' + esc((t.prompt || '').slice(0, 60)) + ((t.prompt || '').length > 60 ? '…' : '') + '</div>'
-      +   '<div class="ig-card-meta">#' + esc(t.id.slice(0, 8)) + (model ? ' · ' + esc(model.name) : '')
-      +     (t.params ? ' · ' + esc([t.params.aspect_ratio,
-              t.params.resolution ? String(t.params.resolution).toUpperCase() : '',
-              t.params.size].filter(Boolean).join(' · ')) : '')
-      +     (t.params && t.params.count > 1 ? ' · ' + t.params.count + ' 张' : '')
-      +     (refCount ? ' · 参考 ' + refCount + ' 张' + (refCount > 1 ? '(合成)' : '') : '')
-      +     ' · ' + fmtTime(t.created_at) + '</div>'
-      +   '<div class="ig-card-foot">' + statusBadge(t.status) + '<div class="ig-acts">' + actions + '</div></div>'
+      +   '<div class="ig-card-meta" title="任务 ' + esc(t.id) + '">' + esc(model ? model.name : '默认模型') + '</div>'
+      +   '<div class="ig-card-meta" title="' + esc(spec + ' · ' + fmtTime(t.created_at)) + '">'
+      +     (spec ? esc(spec) + '<span class="dot-sep">·</span>' : '') + esc(fmtAgo(t.created_at)) + '</div>'
+      +   '<div class="ig-card-foot">' + actions + '</div>'
       + '</div></div>';
   },
 

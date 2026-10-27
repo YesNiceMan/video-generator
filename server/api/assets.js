@@ -8,6 +8,7 @@ const { requireAuth } = require('../auth');
 const { asyncRoute, httpError, uid, now, cleanTags, ensureDir, clamp } = require('../util');
 const { db, DATA_DIR, getSettings } = require('../db');
 const { probe, makeThumb, FFMPEG } = require('../ffmpeg');
+const storage = require('../storage');
 
 const r = Router();
 r.use(requireAuth);
@@ -70,7 +71,7 @@ function autoCategorize(name, type) {
   return best;
 }
 
-const storage = multer.diskStorage({
+const diskStore = multer.diskStorage({
   destination: (req, file, cb) => {
     const dir = path.join(UPLOADS, req.user.id);
     ensureDir(dir);
@@ -79,7 +80,7 @@ const storage = multer.diskStorage({
   filename: (req, file, cb) => cb(null, uid('f-') + '.' + (EXT_BY_MIME[file.mimetype] || 'bin'))
 });
 const upload = multer({
-  storage,
+  storage: diskStore,
   limits: { fileSize: 2 * 1024 ** 3 }, // 单文件最大 2GB
   fileFilter: (req, file, cb) => {
     if (!TYPE_BY_MIME[file.mimetype]) return cb(httpError(400, '不支持的文件类型:' + file.mimetype));
@@ -88,8 +89,9 @@ const upload = multer({
 });
 
 function assetJSON(a) {
-  /* path 是服务器文件系统绝对路径,不回传给前端(thumb_path 除外) */
-  return { ...a, tags: JSON.parse(a.tags || '[]'), path: undefined, storage_path: undefined };
+  /* path/thumb_path 是服务器存储键,不下发;缩略图给可直接使用的 URL */
+  return { ...a, tags: JSON.parse(a.tags || '[]'), path: undefined, storage_path: undefined,
+    thumb_path: a.thumb_path ? `/api/assets/${a.id}/thumbnail` : null };
 }
 
 function assertCanRead(req, a) {
@@ -158,7 +160,8 @@ r.post('/upload', upload.single('file'), asyncRoute(async (req, res) => {
   const category = normalizeCategory(req.body.category) || autoCategorize(originalName, type);
   db.prepare(`INSERT INTO assets(id,owner_id,folder_id,type,name,size,mime,path,thumb_path,width,height,duration,tags,category,created_at)
     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(id, req.user.id, folderId, type, originalName, file.size, file.mimetype, finalPath, thumbPath, info.width, info.height, info.duration, JSON.stringify(cleanTags(req.body.tags)), category, now());
+    .run(id, req.user.id, folderId, type, originalName, file.size, file.mimetype, storage.toKey(finalPath),
+      thumbPath ? storage.toKey(thumbPath) : null, info.width, info.height, info.duration, JSON.stringify(cleanTags(req.body.tags)), category, now());
   addStorage(req.user.id, file.size);
   res.json({ asset: assetJSON(db.prepare('SELECT * FROM assets WHERE id=?').get(id)) });
 }));
@@ -284,8 +287,8 @@ r.post('/batch-delete', asyncRoute(async (req, res) => {
       const a = db.prepare('SELECT * FROM assets WHERE id=?').get(id);
       if (!a) continue;
       assertCanEdit(req, a);
-      try { fs.unlinkSync(a.path); } catch (e) {}
-      try { if (a.thumb_path) fs.unlinkSync(a.thumb_path); } catch (e) {}
+      storage.remove(a.path);
+      if (a.thumb_path) storage.remove(a.thumb_path);
       db.prepare('DELETE FROM assets WHERE id=?').run(a.id);
       if (a.owner_id === req.user.id) {
         db.prepare('UPDATE users SET storage_used = MAX(0, storage_used - ?) WHERE id=?').run(a.size, a.owner_id);
@@ -339,8 +342,8 @@ r.post('/auto-categorize', asyncRoute(async (req, res) => {
 r.delete('/:id', asyncRoute(async (req, res) => {
   const a = db.prepare('SELECT * FROM assets WHERE id=?').get(req.params.id);
   assertCanEdit(req, a);
-  try { fs.unlinkSync(a.path); } catch (e) {}
-  try { if (a.thumb_path) fs.unlinkSync(a.thumb_path); } catch (e) {}
+  storage.remove(a.path);
+  if (a.thumb_path) storage.remove(a.thumb_path);
   db.prepare('DELETE FROM assets WHERE id=?').run(a.id);
   if (a.owner_id === req.user.id) {
     db.prepare('UPDATE users SET storage_used = MAX(0, storage_used - ?) WHERE id=?').run(a.size, a.owner_id);
@@ -382,9 +385,7 @@ r.get('/:id/shares', asyncRoute(async (req, res) => {
 r.get('/:id/file', asyncRoute(async (req, res) => {
   const a = db.prepare('SELECT * FROM assets WHERE id=?').get(req.params.id);
   assertCanRead(req, a);
-  res.setHeader('Content-Type', a.mime || 'application/octet-stream');
-  res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(a.name)}"`);
-  fs.createReadStream(a.path).pipe(res);
+  storage.streamFile(res, a.path, { mime: a.mime, name: a.name });
 }));
 
 r.get('/:id/thumbnail', asyncRoute(async (req, res) => {
@@ -394,12 +395,11 @@ r.get('/:id/thumbnail', asyncRoute(async (req, res) => {
   let tp = a.thumb_path;
   if (!tp && a.type === 'video') {
     const t = path.join(THUMBS, uid('t-') + '.jpg');
-    try { await makeThumb(a.path, t); db.prepare('UPDATE assets SET thumb_path=? WHERE id=?').run(t, a.id); tp = t; } catch (e) { return res.status(404).end(); }
+    try { await makeThumb(storage.toAbs(a.path), t); db.prepare('UPDATE assets SET thumb_path=? WHERE id=?').run(storage.toKey(t), a.id); tp = t; } catch (e) { return res.status(404).end(); }
   }
   if (!tp) return res.status(404).end();
-  res.setHeader('Content-Type', 'image/jpeg');
   res.setHeader('Cache-Control', 'max-age=3600');
-  fs.createReadStream(tp).pipe(res);
+  storage.streamFile(res, tp, { mime: 'image/jpeg' });
 }));
 
 module.exports = r;

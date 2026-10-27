@@ -95,7 +95,7 @@ const DEFAULT_RULES = {
   }
 };
 
-/* 合并用户规则与协议默认值(浅合并:create/response/limits 二级键合并) */
+/* 合并用户规则与协议默认值(浅合并:create/response/limits/async 二级键合并) */
 function normalizeRules(model) {
   const user = parseRules(model);
   const protocol = user.protocol || detectProtocol(model);
@@ -103,7 +103,7 @@ function normalizeRules(model) {
   const out = JSON.parse(JSON.stringify(base));
   out.protocol = protocol;
   if (user.label) out.label = user.label;
-  for (const k of ['create', 'response', 'limits']) {
+  for (const k of ['create', 'response', 'limits', 'async']) {
     if (user[k] && typeof user[k] === 'object') Object.assign(out[k] || (out[k] = {}), user[k]);
   }
   return out;
@@ -325,14 +325,14 @@ function errDetail(data, text) {
 }
 
 /* 下载远程图片 → 本地文件(自动重试),返回带正确扩展名的路径 */
-async function downloadImage(url, basePath) {
+async function downloadImage(url, basePath, headers) {
   const attempts = 3;
   let lastErr = '';
   for (let i = 1; i <= attempts; i++) {
     let res;
     let buf;
     try {
-      res = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+      res = await fetch(url, { headers: headers || undefined, signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       /* 读体同样要在 try 内:CDN 断流时 undici 抛 "terminated",外层不接就变成无意义报错 */
       buf = Buffer.from(await res.arrayBuffer());
@@ -460,6 +460,145 @@ function openaiBodyFromTemplate(ctx) {
 }
 
 /* 解析 OpenAI 风格响应:{data:[{url}|{b64_json}]}(字段名由 rules.response 配置) */
+/* ---------- 异步生图收单(第四十一轮 · rules.async) ----------
+ * 有些网关对 OpenAI 兼容的 /images/generations 立刻回 {id, status:"queued", data:[]}:
+ * 图要另走「任务状态 + 素材清单 + 素材内容」三类端点取(实测:中转站 ys666 的
+ * gpt-image-2.5-sunburst / -flare 系列,取件端点还要求 x-creative-contract-version 头)。
+ * 不配这段规则时,平台会把「已受理」当成「无结果」判失败,而网关照样计费。
+ */
+const ASYNC_DEFAULTS = {
+  job_id_path: 'id',
+  pending_field: 'status',
+  pending_values: ['queued', 'pending', 'submitted', 'processing', 'running', 'in_progress'],
+  task_path: '',
+  task_headers: null,
+  status_field: 'status',
+  status_values: { completed: ['completed', 'succeeded', 'success'], failed: ['failed', 'error', 'cancelled', 'canceled'] },
+  error_field: 'error',
+  assets_path: '',
+  assets_data_path: '',
+  asset_id_field: 'id',
+  content_path: '',
+  interval_ms: 5000,
+  timeout_ms: 600000
+};
+
+function normalizeAsync(rules) {
+  const a = rules && rules.async;
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return null;
+  const out = Object.assign({}, ASYNC_DEFAULTS, a);
+  out.status_values = Object.assign({}, ASYNC_DEFAULTS.status_values, a.status_values || {});
+  return out;
+}
+
+/* 「已受理但还没出图」:状态在排队清单里,且同步响应里没有可用图片 */
+function isQueuedResponse(data, cfg) {
+  if (!data || typeof data !== 'object') return false;
+  if (Array.isArray(data.data) && data.data.length) return false;
+  const st = String(getPath(data, cfg.pending_field) || '').toLowerCase();
+  return !!st && cfg.pending_values.map(String).includes(st);
+}
+
+function fillTokens(tpl, vars) {
+  let out = String(tpl || '');
+  for (const k of Object.keys(vars)) out = out.split('<' + k + '>').join(encodeURIComponent(String(vars[k] == null ? '' : vars[k])));
+  return out;
+}
+
+async function getJSON(url, headers, label, timeoutMs) {
+  let res, text;
+  try {
+    res = await fetch(url, { headers: headers || {}, signal: AbortSignal.timeout(Number(timeoutMs) > 0 ? timeoutMs : 60000) });
+    text = await res.text();
+  } catch (e) {
+    throw new Error(label + '失败(网络错误:' + (e.message || e.name || '') + ')');
+  }
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (e) {}
+  if (!res.ok) throw new Error(label + '失败(HTTP ' + res.status + '): ' + errDetail(data, text));
+  if (!data) throw new Error(label + '响应不是合法 JSON: ' + String(text).slice(0, 200));
+  return data;
+}
+
+/* 轮询任务 → 列素材 → 逐个下载落盘,返回与同步路径同款的文件清单 */
+async function collectAsyncImages(data, opt) {
+  const { base, headers, cfg, outBase, onProgress } = opt;
+  const jobId = String(getPath(data, cfg.job_id_path) || (data && data.id) || '');
+  if (!jobId) throw new Error('异步生图响应里没有任务号(字段 ' + cfg.job_id_path + ' 为空): ' + detailText(data).slice(0, 160));
+  if (!cfg.task_path) throw new Error('该模型按异步受理(task ' + jobId + ')但 rules.async.task_path 未配置');
+  const qh = Object.assign({}, headers, cfg.task_headers || {});
+  const began = Date.now();
+  const done = (cfg.status_values.completed || []).map(String);
+  const bad = (cfg.status_values.failed || []).map(String);
+  let task = null;
+  const interval = Math.max(1000, Number(cfg.interval_ms) || 5000);
+  const budget = Math.max(interval, Number(cfg.timeout_ms) || 600000);
+  for (;;) {
+    task = await getJSON(base + fillTokens(cfg.task_path, { job_id: jobId }), qh, '异步任务查询');
+    const st = String(getPath(task, cfg.status_field) || '').toLowerCase();
+    if (done.includes(st)) break;
+    if (bad.includes(st)) {
+      const err = cfg.error_field ? getPath(task, cfg.error_field) : task.error;
+      throw new Error('网关异步任务失败(' + st + '): ' + (errDetail(err, detailText(task)) || '服务方未给出原因')
+        + '(task ' + jobId + ')');
+    }
+    if (Date.now() - began > budget) {
+      throw new Error('等待网关异步出图超时(' + Math.round(budget / 1000) + 's,当前状态 ' + (st || '未知')
+        + '):task ' + jobId + ' 仍在服务方,可到站内核对后再决定是否重试');
+    }
+    if (onProgress) onProgress(Math.min(80, 20 + Math.round((Date.now() - began) / budget * 60)));
+    await sleep(interval);
+  }
+  if (onProgress) onProgress(85);
+  let list = [];
+  if (cfg.assets_path) {
+    const assets = await getJSON(base + fillTokens(cfg.assets_path, { job_id: jobId }), qh, '异步素材清单');
+    list = cfg.assets_data_path ? getPath(assets, cfg.assets_data_path) : assets;
+    if (!Array.isArray(list)) list = Array.isArray(assets && assets.data) ? assets.data : (Array.isArray(assets && assets.items) ? assets.items : []);
+    if (!cfg.content_path) {
+      /* 素材清单里直接带地址时,退回普通 URL 下载 */
+      return saveOpenAiImages({ data: list }, Object.assign({}, opt.rules || {}, {
+        response: { data_path: '', url_field: cfg.asset_url_field || 'url', b64_field: cfg.asset_b64_field || 'b64_json' }
+      }), outBase, onProgress);
+    }
+    list = list.map(a => ({ url: base + fillTokens(cfg.content_path, {
+      asset_id: a && a[cfg.asset_id_field], job_id: jobId
+    }) }));
+  } else {
+    /* 没有素材端点:结果就直接挂在任务对象上(按 rules.response 解析) */
+    list = [task];
+  }
+  if (!list.length) throw new Error('网关异步任务已完成但素材清单为空(task ' + jobId + ')');
+  const files = [];
+  for (const item of list) {
+    const url = item && item.url;
+    if (typeof url === 'string' && /^https?:[/]/i.test(url)) {
+      files.push(await downloadImage(url, outBase + '-' + (files.length + 1), cfg.task_headers ? qh : undefined));
+    } else {
+      const viaResp = await saveOpenAiImages(item, opt.rules, outBase + '-' + (files.length + 1), null);
+      files.push(...viaResp);
+    }
+  }
+  if (!files.length) throw new Error('网关异步任务已完成但没取到可用图片(task ' + jobId + ')');
+  if (onProgress) onProgress(92);
+  return files;
+}
+
+/* 生图结果统一入口:同步响应直接解析;网关按异步受理则走 rules.async 收单 */
+async function saveOpenAiResult(data, ctx) {
+  const { rules, base, headers, outBase, onProgress } = ctx;
+  const cfg = normalizeAsync(rules);
+  if (cfg && isQueuedResponse(data, cfg)) {
+    return collectAsyncImages(data, { base, headers, cfg, outBase, onProgress, rules });
+  }
+  if (!cfg && isQueuedResponse(data, Object.assign({}, ASYNC_DEFAULTS, { task_path: '' }))) {
+    throw new Error('网关已受理但响应里没有图片(status=' + String(getPath(data, 'status') || '') + ',task '
+      + (data && data.id) + '):该模型按异步出图,请在后台「生成规则 JSON」补 rules.async'
+      + '(task_path / assets_path / content_path,路径相对 API 地址),否则图取不回来而网关照常计费');
+  }
+  return saveOpenAiImages(data, rules, outBase, onProgress);
+}
+
 async function saveOpenAiImages(data, rules, outBase, onProgress) {
   const resp = rules.response || {};
   let list = data;
@@ -534,7 +673,7 @@ async function generateOpenAiImage(ctx) {
     if (onProgress) onProgress(15);
     const data = await postJSON(base + String(create.path || '/images/generations').replace(/^\/?/, '/'),
       { ...headers, 'Content-Type': 'application/json' }, body);
-    return saveOpenAiImages(data, rules, outBase, onProgress);
+    return saveOpenAiResult(data, { rules, base, headers, outBase, onProgress });
   }
 
   /* 图生图 / 多图合成:带参考图且规则未禁用 edit_path → multipart /images/edits */
@@ -570,7 +709,7 @@ async function generateOpenAiImage(ctx) {
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch (e) {}
     if (!res.ok) throw new Error('图生图请求失败(HTTP ' + res.status + '): ' + errDetail(data, text));
-    return saveOpenAiImages(data, rules, outBase, onProgress);
+    return saveOpenAiResult(data, { rules, base, headers, outBase, onProgress });
   }
 
   /* 文生图:JSON 请求体(rules.create.body 模板驱动) */
@@ -578,7 +717,7 @@ async function generateOpenAiImage(ctx) {
   const body = openaiBodyFromTemplate(ctx);
   const data = await postJSON(base + String(create.path || '/images/generations').replace(/^\/?/, '/'),
     { ...headers, 'Content-Type': 'application/json' }, body, create.timeout_ms);
-  return saveOpenAiImages(data, rules, outBase, onProgress);
+  return saveOpenAiResult(data, { rules, base, headers, outBase, onProgress });
 }
 
 /* ---------- 适配器:Google Gemini generateContent ---------- */
@@ -741,7 +880,8 @@ module.exports = {
   parseRules, normalizeRules, detectProtocol, errText,
   fillTemplate, sizeToWH, whToAspect, downloadImage, writeImageBuffer,
   modelCaps, sizeFromRatio, geminiAspect, snapAspect, geminiImageSize, snapTier, resolutionToPx,
-  sizeModeOf, tiersOf, ratiosOf, imageSpecMeta
+  sizeModeOf, tiersOf, ratiosOf, imageSpecMeta,
+  normalizeAsync, isQueuedResponse, fillTokens, saveOpenAiResult
 };
 
 

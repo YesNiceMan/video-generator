@@ -8,6 +8,7 @@ const { asyncRoute, httpError, uid, now, clamp, ensureDir } = require('../util')
 const multer = require('multer');
 const { execFile } = require('child_process');
 const { db, getSettings, setSetting, DATA_DIR } = require('../db');
+const storage = require('../storage');
 const { enqueue, pump, running } = require('../worker');
 const credits = require('../credits');
 
@@ -35,8 +36,9 @@ function normalizeRulesInput(raw) {
   let v = raw;
   if (typeof v === 'string') { try { v = JSON.parse(v); } catch (e) { throw httpError(400, '生成规则不是合法的 JSON:' + e.message); } }
   if (!v || typeof v !== 'object' || Array.isArray(v)) throw httpError(400, '生成规则必须是 JSON 对象');
-  /* 第二十五轮:并入生图协议(openai-image / gemini-image / img-ffmpeg) */
-  const known = ['agnes-flash', 'agnes-v2', 'openai-video', 'ffmpeg', 'openai-image', 'gemini-image', 'img-ffmpeg'];
+  /* 第二十五轮:并入生图协议(openai-image / gemini-image / img-ffmpeg)
+     第四十二轮:并入文本协议 openai-chat */
+  const known = ['agnes-flash', 'agnes-v2', 'openai-video', 'ffmpeg', 'openai-image', 'gemini-image', 'img-ffmpeg', 'openai-chat'];
   if (v.protocol && !known.includes(v.protocol)) throw httpError(400, '未知的生成协议: ' + v.protocol + '(可选:' + known.join('/') + ')');
   return JSON.stringify(v);
 }
@@ -54,6 +56,12 @@ function mergeImageCaps(rulesRaw, capsRaw) {
   if (caps.length) rules.caps = caps;
   else delete rules.caps;
   return rules;
+}
+
+/* 模型类型归一化(第四十二轮加入 text-generation;未知值仍按 image-to-video 兜底) */
+const MODEL_TYPES = ['image-to-video', 'text-to-video', 'text-to-image', 'text-generation'];
+function normalizeType(t) {
+  return MODEL_TYPES.includes(t) ? t : 'image-to-video';
 }
 
 /* 规范化 API 地址(去掉尾斜杠),Key 与模型 ID 截断 */
@@ -114,12 +122,12 @@ async function detectAvailableModels({ apiBase, apiKey, timeoutMs = 12000 } = {}
 r.get('/stats', asyncRoute(async (req, res) => {
   const users = db.prepare('SELECT COUNT(*) c FROM users').get().c;
   const assets = db.prepare('SELECT COUNT(*) c FROM assets').get().c;
-  const storage = db.prepare('SELECT COALESCE(SUM(size),0) s FROM assets').get().s;
+  const usedBytes = db.prepare('SELECT COALESCE(SUM(size),0) s FROM assets').get().s;
   const tasks = db.prepare('SELECT status, COUNT(*) c FROM tasks GROUP BY status').all();
   const byStatus = {}; tasks.forEach(t => byStatus[t.status] = t.c);
   const models = db.prepare('SELECT COUNT(*) c FROM models WHERE enabled=1').get().c;
   const styles = db.prepare('SELECT COUNT(*) c FROM styles').get().c;
-  res.json({ stats: { users, assets, storage, models, styles, tasks: byStatus, running: running.size } });
+  res.json({ stats: { users, assets, storage: usedBytes, models, styles, tasks: byStatus, running: running.size } });
 }));
 
 // ---------- 用户管理 ----------
@@ -234,25 +242,29 @@ r.post('/models', asyncRoute(async (req, res) => {
   const id = uid('m-');
   /* 模型每秒积分消耗(0/留空 = 跟随系统设置里的全局定价) */
   const creditPerSecond = Math.max(0, Number(b.credit_per_second) || 0);
+  /* 第四十轮:免费标记可在后台手动设置(此前只能建完再改库) */
+  const isFree = b.is_free === undefined ? 0 : (b.is_free ? 1 : 0);
   /* 第二十三轮:新建模型未提供参数模板时补默认标准参数,
      避免空 schema 导致任务参数(时长/帧率等)读不到、积分按默认 5s 误计 */
   const schemaProvided = Array.isArray(b.params_schema) && b.params_schema.length > 0;
+  /* 文本模型(第四十二轮)不用参数模板:温度/上限由 rules 与系统设置决定,默认给空清单 */
+  const isTextModel = b.type === 'text-generation';
   const effSchema = schemaProvided ? b.params_schema : (isImageModel ? [
     { key: 'size', label: '尺寸', type: 'select', options: ['1024x1024', '1536x1024', '1024x1536', 'auto'], default: '1024x1024' },
     { key: 'seed', label: '随机种子(-1 随机)', type: 'number', default: -1 }
-  ] : [
+  ] : isTextModel ? [] : [
     { key: 'duration', label: '时长(秒)', type: 'range', min: 1, max: 20, step: 1, default: 5 },
     { key: 'fps', label: '帧率', type: 'select', options: [23.976, 24, 25, 29.97, 30, 48, 50, 60], default: 24 },
     { key: 'motion', label: '运动强度', type: 'range', min: 0, max: 1, step: 0.05, default: 0.5 },
     { key: 'seed', label: '随机种子(-1 随机)', type: 'number', default: -1 }
   ]);
-  const typeVal = isImageModel ? 'text-to-image' : (b.type === 'text-to-video' ? 'text-to-video' : 'image-to-video');
-  db.prepare(`INSERT INTO models(id,name,type,version,description,endpoint,params_schema,enabled,concurrency,api_base,api_key,model_id,rules,credit_per_second,created_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+  const typeVal = isImageModel ? 'text-to-image' : normalizeType(b.type);
+  db.prepare(`INSERT INTO models(id,name,type,version,description,endpoint,params_schema,enabled,concurrency,api_base,api_key,model_id,rules,credit_per_second,is_free,created_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(id, name, typeVal,
       String(b.version || 'v1').slice(0, 20), String(b.description || '').slice(0, 500), String(b.endpoint || '').slice(0, 200),
       JSON.stringify(effSchema), b.enabled === false ? 0 : 1, clamp(Number(b.concurrency) || 1, 1, 64, 1),
-      api.api_base || '', api.api_key || '', api.model_id || '', rules || '', creditPerSecond, now());
+      api.api_base || '', api.api_key || '', api.model_id || '', rules || '', creditPerSecond, isFree, now());
   res.json({ model: modelJSON(db.prepare('SELECT * FROM models WHERE id=?').get(id)) });
 }));
 
@@ -265,8 +277,10 @@ r.patch('/models/:id', asyncRoute(async (req, res) => {
   if (b.version !== undefined) { sets.push('version=?'); params.push(String(b.version).slice(0, 20)); }
   if (b.description !== undefined) { sets.push('description=?'); params.push(String(b.description).slice(0, 500)); }
   if (b.endpoint !== undefined) { sets.push('endpoint=?'); params.push(String(b.endpoint).slice(0, 200)); }
-  if (b.type !== undefined) { sets.push('type=?'); params.push(b.type === 'text-to-image' ? 'text-to-image' : (b.type === 'text-to-video' ? 'text-to-video' : 'image-to-video')); }
+  if (b.type !== undefined) { sets.push('type=?'); params.push(normalizeType(b.type)); }
   if (b.enabled !== undefined) { sets.push('enabled=?'); params.push(b.enabled ? 1 : 0); }
+  /* 第四十轮:免费标记可手动切换(免费 = 不扣平台积分,与服务商是否收费无关) */
+  if (b.is_free !== undefined) { sets.push('is_free=?'); params.push(b.is_free ? 1 : 0); }
   if (b.concurrency !== undefined) { sets.push('concurrency=?'); params.push(clamp(Number(b.concurrency) || 1, 1, 64, 1)); }
   if (b.params_schema !== undefined) { sets.push('params_schema=?'); params.push(JSON.stringify(b.params_schema || [])); }
   /* 模型每秒积分消耗:>=0,0 表示使用全局定价;免费模型恒不扣分 */
@@ -317,11 +331,13 @@ r.delete('/models/:id', asyncRoute(async (req, res) => {
    - 400/422(参数校验)或 OpenAI 风格业务错误 → 路由存在,判定通过
    - 明确的"not supported"类应答 → 判定失败并注明需服务商开通 */
 const PROBE_CREATE_PATHS = ['/videos', '/videos/generations', '/video/generations'];
-async function probeCreatePath(m, nr) {
+async function probeCreatePath(m, nr, opts) {
+  opts = opts || {};
   const base = String(m.api_base || '').replace(/[/]+$/, '');
   const userPath = (() => { try { const u = JSON.parse(m.rules || '{}'); return u.create && u.create.path ? String(u.create.path) : ''; } catch (e) { return ''; } })();
-  const candidates = userPath ? [userPath] : [...new Set([String((nr.create && nr.create.path) || '/videos'), ...PROBE_CREATE_PATHS].map(p => p.replace(/^\/?/, '/')))];
-  const payload = { model: '__route_probe__', prompt: 'route probe(not a real request)', seconds: '1' };
+  const fallbacks = opts.paths || PROBE_CREATE_PATHS;
+  const candidates = userPath ? [userPath] : [...new Set([String((nr.create && nr.create.path) || (opts.defaultPath || '/videos')), ...fallbacks].map(p => p.replace(/^\/?/, '/')))];
+  const payload = opts.payload || { model: '__route_probe__', prompt: 'route probe(not a real request)', seconds: '1' };
   const tried = [];
   for (const p of candidates) {
     let res;
@@ -377,16 +393,17 @@ async function runModelCheck(m) {
     }
   } catch (e) { problems.push('params_schema 不是合法的 JSON 数组'); }
   /* 第二十五轮:text-to-image(AI 生图)并入合法模型类型 */
-  if (!['image-to-video', 'text-to-video', 'text-to-image'].includes(m.type)) problems.push(`未知模型类型: ${m.type}`);
-  /* 检验生成规则(rules):视频模型走 adapters,生图模型走 imagegen */
+  if (!MODEL_TYPES.includes(m.type)) problems.push(`未知模型类型: ${m.type}`);
+  /* 检验生成规则(rules):视频走 adapters,生图走 imagegen,文本走 textgen(第四十二轮) */
   try {
     const isImage = m.type === 'text-to-image';
-    const { normalizeRules } = require(isImage ? '../imagegen' : '../adapters');
+    const isText = m.type === 'text-generation';
+    const { normalizeRules } = require(isText ? '../textgen' : (isImage ? '../imagegen' : '../adapters'));
     const nr = normalizeRules(m);
     if (!nr.protocol) problems.push('生成规则未指定协议,将自动识别');
-    const known = isImage
-      ? ['openai-image', 'gemini-image', 'img-ffmpeg']
-      : ['agnes-flash', 'agnes-v2', 'openai-video', 'ffmpeg'];
+    const known = isText ? ['openai-chat']
+      : isImage ? ['openai-image', 'gemini-image', 'img-ffmpeg']
+        : ['agnes-flash', 'agnes-v2', 'openai-video', 'ffmpeg'];
     if (nr.protocol && !known.includes(nr.protocol)) problems.push('生成规则协议未知: ' + nr.protocol);
   } catch (e) { problems.push('生成规则解析失败: ' + (e.message || e)); }
   const ep = String(m.endpoint || '');
@@ -417,14 +434,26 @@ async function runModelCheck(m) {
         if (e.status) problems.push(msg); else apiNote = msg;
       }
     }
-    /* 创建路径探活(仅 openai-video 通用协议):检查阶段即发现"网关不支持视频 API/路径不对",
-       避免"检查通过但提交生成必失败"——探测请求用无效模型名,不会产生真实任务 */
+    /* 创建路径探活:视频协议探 /videos，文本协议探 /chat/completions(第四十二轮) ——
+       都用无效模型名，网关只回业务校验错误，不会建单也不会计费 */
     try {
-      const { normalizeRules: nr2, detectProtocol: dp, parseRules: pr2 } = require('../adapters');
-      if (dp(m) === 'openai-video') {
-        const probe = await probeCreatePath(m, nr2(m));
-        if (probe.problem) problems.push(probe.problem);
-        if (probe.note) apiNote = apiNote ? apiNote + ' · ' + probe.note : probe.note;
+      if (m.type === 'text-generation') {
+        const { normalizeRules: nrT, detectProtocol: dpT } = require('../textgen');
+        if (dpT(m) === 'openai-chat') {
+          const probe = await probeCreatePath(m, nrT(m), {
+            defaultPath: '/chat/completions', paths: [],
+            payload: { model: '__route_probe__', messages: [{ role: 'user', content: 'route probe(not a real request)' }], max_tokens: 1 }
+          });
+          if (probe.problem) problems.push(probe.problem);
+          if (probe.note) apiNote = apiNote ? apiNote + ' · ' + probe.note : probe.note;
+        }
+      } else {
+        const { normalizeRules: nr2, detectProtocol: dp } = require('../adapters');
+        if (dp(m) === 'openai-video') {
+          const probe = await probeCreatePath(m, nr2(m));
+          if (probe.problem) problems.push(probe.problem);
+          if (probe.note) apiNote = apiNote ? apiNote + ' · ' + probe.note : probe.note;
+        }
       }
     } catch (e) { /* 探活自身异常不影响检查结论 */ }
   } else if (m.api_base || m.api_key) {
@@ -522,6 +551,40 @@ r.post('/models/:id/selftest', asyncRoute(async (req, res) => {
     });
   }
 
+  /* 第四十二轮:文本模型自检 → 真发一次极短 chat 请求并落 tasks 记录
+     (免费文本模型 0 积分;按次计费的模型这次自检会扣一次) */
+  if (m.type === 'text-generation') {
+    const textgen = require('../textgen');
+    const taskId = uid('t-');
+    const began = Date.now();
+    try {
+      /* 自检只测连通性:45s 内不返回就判失败,不让管理员在弹窗前干等 */
+      const { content, usage } = await textgen.complete(m,
+        [{ role: 'user', content: '只回复两个字：收到' }], { max_tokens: 24, temperature: 0, timeout_ms: 45000 });
+      const ms = Date.now() - began;
+      const price = textgen.pricePerCall(m);
+      if (price > 0) credits.deduct(req.user.id, price, '文本模型自检 · ' + m.name, taskId);
+      db.prepare(`INSERT INTO tasks(id,user_id,type,model_id,params,prompt,status,progress,cost,created_at,started_at,finished_at,result_asset_ids,linked_asset_ids)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(taskId, req.user.id, 'text-generation', m.id,
+          JSON.stringify({ task: 'selftest', engine: 'textgen', ms, chars_in: 9, chars_out: String(content).length, usage, selftest: true }),
+          '[系统自检] 文本模型连通性测试', 'completed', 100, price, began, began, Date.now(), '[]', '[]');
+      return res.json({
+        check,
+        task: db.prepare('SELECT * FROM tasks WHERE id=?').get(taskId),
+        message: `文本模型自检通过(${m.name})：${(ms / 1000).toFixed(1)}s 返回「${String(content).slice(0, 24)}」`
+      });
+    } catch (e) {
+      const msg = String(e.message || e).slice(0, 300);
+      db.prepare(`INSERT INTO tasks(id,user_id,type,model_id,params,prompt,status,progress,cost,error,created_at,started_at,finished_at,result_asset_ids,linked_asset_ids)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(taskId, req.user.id, 'text-generation', m.id,
+          JSON.stringify({ task: 'selftest', engine: 'textgen', selftest: true, ms: Date.now() - began }),
+          '[系统自检] 文本模型连通性测试', 'failed', 0, 0, msg, began, began, Date.now(), '[]', '[]');
+      throw httpError(502, '文本模型自检失败：' + msg);
+    }
+  }
+
   // 用 lavfi 生成一张测试源图入资产库(admin 名下)
   const { FFMPEG, probe } = require('../ffmpeg');
   const { ensureDir } = require('../util');
@@ -534,7 +597,7 @@ r.post('/models/:id/selftest', asyncRoute(async (req, res) => {
   db.prepare(`INSERT INTO assets(id,owner_id,type,name,size,mime,path,width,height,tags,source,created_at)
     VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(imgId, req.user.id, 'image', `自检测试图_${new Date().toISOString().slice(11, 19)}.png`,
-      fs.statSync(imgPath).size, 'image/png', imgPath, info.width, info.height,
+      fs.statSync(imgPath).size, 'image/png', storage.toKey(imgPath), info.width, info.height,
       JSON.stringify(['system-selftest']), 'system', now());
 
   // 提交真实任务(免费模型不扣积分)
@@ -598,10 +661,22 @@ r.get('/settings', asyncRoute(async (req, res) => {
 
 r.patch('/settings', asyncRoute(async (req, res) => {
   const b = req.body || {};
-  /* 第二十五轮:creditPerImage = AI 生图每张积分定价(免费生图模型恒 0) */
-  const allowed = ['maxConcurrentTasks', 'defaultQuotaGB', 'gpuPool', 'maxUploadMB', 'creditPerSecond', 'freeCredits', 'creditPerImage'];
+  /* 第二十五轮:creditPerImage = AI 生图每张积分定价(免费生图模型恒 0)
+     第四十二轮:creditPerText = 文本处理每次积分;defaultTextModel = 默认文本模型 id */
+  const allowed = ['maxConcurrentTasks', 'defaultQuotaGB', 'gpuPool', 'maxUploadMB', 'creditPerSecond', 'freeCredits', 'creditPerImage', 'creditPerText', 'defaultTextModel'];
   for (const k of allowed) {
-    if (b[k] !== undefined) setSetting(k, k === 'gpuPool' ? String(b[k]).slice(0, 300) : Number(b[k]));
+    if (b[k] === undefined) continue;
+    if (k === 'gpuPool') { setSetting(k, String(b[k]).slice(0, 300)); continue; }
+    /* defaultTextModel 是模型 id 字符串,不能走下面的 Number() 转换(会被转成 NaN → 存成 null) */
+    if (k === 'defaultTextModel') {
+      const id = String(b[k] || '').trim().slice(0, 40);
+      if (id && !db.prepare("SELECT id FROM models WHERE id=? AND type='text-generation' AND enabled=1").get(id)) {
+        throw httpError(400, '默认文本模型不存在或已禁用: ' + id);
+      }
+      setSetting(k, id);
+      continue;
+    }
+    setSetting(k, Number(b[k]));
   }
   /* 段时长积分覆盖表: { "5": 25, ... } */
   if (b.creditOverrides !== undefined && b.creditOverrides && typeof b.creditOverrides === 'object') {
@@ -842,6 +917,22 @@ function manifestThemeId(raw) {
   return '';
 }
 
+/* 解压主题包:Windows 没有 /usr/bin/unzip,改用系统自带的 PowerShell Expand-Archive;
+   路径经环境变量传入,不拼进命令行 */
+function extractZip(zipPath, destDir) {
+  return new Promise((resolve, reject) => {
+    const fail = err => reject(httpError(400, '主题包解压失败(仅支持 .zip):' + (err.message || '')));
+    if (process.platform === 'win32') {
+      execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+        'Expand-Archive -LiteralPath $env:VG_ZIP -DestinationPath $env:VG_DIR -Force'],
+      { env: { ...process.env, VG_ZIP: zipPath, VG_DIR: destDir } }, err => err ? fail(err) : resolve());
+      return;
+    }
+    const exe = fs.existsSync('/usr/bin/unzip') ? '/usr/bin/unzip' : 'unzip';
+    execFile(exe, ['-o', '-q', zipPath, '-d', destDir], err => err ? fail(err) : resolve());
+  });
+}
+
 /* 上传外部主题包:支持 .zip 主题包(内含 theme.json/app.css/layout.html),
    或分别上传 css / layout / manifest 三个文件 */
 const themeUpload = multer({
@@ -874,9 +965,7 @@ r.post('/themes/upload', themeUpload.fields([
       /* 解压 zip 到临时目录 */
       const zipPath = path.join(tmpDir, 'theme.zip');
       fs.writeFileSync(zipPath, zip.buffer);
-      await new Promise((resolve, reject) => {
-        execFile('/usr/bin/unzip', ['-o', '-q', zipPath, '-d', path.join(tmpDir, 'extract')], (err) => err ? reject(httpError(400, '主题包解压失败(仅支持 .zip):' + (err.message || ''))) : resolve());
-      });
+      await extractZip(zipPath, path.join(tmpDir, 'extract'));
       /* 在解压目录中寻找主题文件(支持根目录或单层子目录) */
       const searchDirs = [];
       const extractRoot = path.join(tmpDir, 'extract');

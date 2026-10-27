@@ -525,7 +525,8 @@ function seed() {
     { key: 'seed', label: '随机种子(-1 随机)', type: 'number', default: -1 }
   ];
   {
-    const emptyModels = db.prepare("SELECT id, name FROM models WHERE params_schema IS NULL OR TRIM(params_schema)='' OR params_schema='[]'").all();
+    /* 文本模型(第四十二轮)本就没有生成参数模板(温度/上限走 rules 与系统设置),不能给它塞视频参数 */
+    const emptyModels = db.prepare("SELECT id, name FROM models WHERE type<>'text-generation' AND (params_schema IS NULL OR TRIM(params_schema)='' OR params_schema='[]')").all();
     for (const m of emptyModels) {
       db.prepare('UPDATE models SET params_schema=? WHERE id=?').run(JSON.stringify(STD_PARAM_SCHEMA), m.id);
       console.log('[迁移] 模型「' + m.name + '」参数模板为空,已补写标准参数(时长/帧率/运动/种子)');

@@ -8,6 +8,7 @@ const fs = require('fs');
 const { db, getSettings, DATA_DIR } = require('./db');
 const { uid, now } = require('./util');
 const { probe, makeThumb } = require('./ffmpeg');
+const storage = require('./storage');
 const adapters = require('./adapters');
 const credits = require('./credits');
 
@@ -128,8 +129,8 @@ function resultImageAsset(task, filePath, idx, total) {
   const name = 'AI生图_' + task.id.slice(0, 6) + suffix + '.' + ext;
   db.prepare(`INSERT INTO assets(id,owner_id,folder_id,type,name,size,mime,path,thumb_path,width,height,duration,tags,category,source,created_at)
     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(assetId, task.user_id, null, 'image', name, fs.statSync(stored).size, mime, stored,
-      fs.existsSync(thumbPath) ? thumbPath : null, p.width, p.height, null,
+    .run(assetId, task.user_id, null, 'image', name, fs.statSync(stored).size, mime, storage.toKey(stored),
+      fs.existsSync(thumbPath) ? storage.toKey(thumbPath) : null, p.width, p.height, null,
       JSON.stringify(['imggen', 'generated']), '分镜', 'imggen', now());
   db.prepare('UPDATE users SET storage_used = storage_used + ? WHERE id=?').run(fs.statSync(stored).size, task.user_id);
   return assetId;
@@ -149,7 +150,7 @@ function resultAsset(task, filePath) {
   try { makeThumb(stored, thumbPath).catch(() => {}); } catch (e) {}
   db.prepare(`INSERT INTO assets(id,owner_id,folder_id,type,name,size,mime,path,thumb_path,width,height,duration,tags,source,created_at)
     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(assetId, task.user_id, null, 'video', `生成结果_${task.id.slice(0, 6)}.mp4`, fs.statSync(stored).size, 'video/mp4', stored, thumbPath, p.width, p.height, p.duration, JSON.stringify(['generated']), 'generated', now());
+    .run(assetId, task.user_id, null, 'video', `生成结果_${task.id.slice(0, 6)}.mp4`, fs.statSync(stored).size, 'video/mp4', storage.toKey(stored), storage.toKey(thumbPath), p.width, p.height, p.duration, JSON.stringify(['generated']), 'generated', now());
   db.prepare('UPDATE users SET storage_used = storage_used + ? WHERE id=?').run(fs.statSync(stored).size, task.user_id);
   return assetId;
 }
@@ -161,14 +162,14 @@ async function processTask(task) {
   const outFile = path.join(GENERATED_DIR, task.id + '.mp4');
 
   if (task.type === 'image-to-video') {
-    const src = db.prepare('SELECT * FROM assets WHERE id=?').get(task.source_asset_id);
+    const src = storage.hydrate(db.prepare('SELECT * FROM assets WHERE id=?').get(task.source_asset_id));
     if (!src || !fs.existsSync(src.path)) throw new Error('源图片资产不存在');
     const model = task.model_id ? db.prepare('SELECT * FROM models WHERE id=?').get(task.model_id) : null;
 
     // 获取关联的参考资产(占位符链接)
     const linked = [];
     for (const id of JSON.parse(task.linked_asset_ids || '[]')) {
-      const a = db.prepare('SELECT * FROM assets WHERE id=?').get(id);
+      const a = storage.hydrate(db.prepare('SELECT * FROM assets WHERE id=?').get(id));
       if (a && fs.existsSync(a.path)) linked.push(a);
     }
 
@@ -204,7 +205,7 @@ async function processTask(task) {
       : (task.source_asset_id ? [task.source_asset_id] : []);
     const refAssets = [];
     for (const rid of refIds.slice(0, 8)) {
-      const a = db.prepare('SELECT * FROM assets WHERE id=?').get(String(rid));
+      const a = storage.hydrate(db.prepare('SELECT * FROM assets WHERE id=?').get(String(rid)));
       if (a && a.type === 'image' && fs.existsSync(a.path)) refAssets.push(a);
     }
     const refAsset = refAssets[0] || null;
@@ -243,8 +244,10 @@ async function processTask(task) {
     const clips = db.prepare(`SELECT c.id, c.duration, c.asset_id, a.path FROM clips c JOIN scenes s ON c.scene_id=s.id JOIN assets a ON c.asset_id=a.id
       WHERE s.episode_id=? ORDER BY s.order_index, c.order_index`).all(task.episode_id);
     if (!clips.length) throw new Error('该分集还没有可导出的片段');
+    const missing = clips.filter(c => !storage.exists(c.path));
+    if (missing.length) throw new Error(`${missing.length}/${clips.length} 个片段的素材文件不在 ${DATA_DIR} 下(跨机器迁移请一并复制 data/ 目录)`);
     await exportMod.exportEpisode({
-      clips: clips.map(c => ({ path: c.path, duration: c.duration })),
+      clips: clips.map(c => ({ path: storage.toAbs(c.path), duration: c.duration })),
       output: outFile,
       onProgress: () => {}
     });

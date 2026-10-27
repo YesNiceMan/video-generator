@@ -108,11 +108,18 @@ const StylesView = {
       btn.addEventListener('click', async () => {
         const id = btn.dataset.fav;
         const s = this.state.styles.find(x => x.id === id);
-        if (s.is_favorite) await API.del('/styles/' + id + '/favorite');
-        else await API.post('/styles/' + id + '/favorite');
-        const res = await API.get('/styles');
-        this.state.styles = res.items;
-        this.renderGrid();
+        if (!s || btn.disabled) return;
+        btn.disabled = true;                       /* 连点会重复收藏 / 取消,先锁住 */
+        try {
+          if (s.is_favorite) await API.del('/styles/' + id + '/favorite');
+          else await API.post('/styles/' + id + '/favorite');
+          const res = await API.get('/styles');
+          this.state.styles = res.items;
+          this.renderGrid();
+        } catch (e) {
+          toast('收藏状态未能保存：' + e.message, 'err');
+          btn.disabled = false;
+        }
       });
     });
     grid.querySelectorAll('[data-apply]').forEach(btn => {
@@ -202,18 +209,20 @@ const StylesView = {
         { key: 'tags', label: '标签(逗号分隔)', placeholder: '如： 电影， 复古', value: '' },
         { key: 'visibility', label: '可见性', type: 'select', options: [{ value: 'public', label: '公开' }, { value: 'private', label: '私有' }], value: 'public' }
       ],
-      submitText: '创建'
+      submitText: '创建',
+      /* 交给 formModal 的 onSubmit 统一处理:失败时弹窗保持打开、按钮恢复可用,
+         不会「弹已关闭 → 用户以为存了 → 数据其实没进去」 */
+      onSubmit: async (vals) => {
+        await API.post('/styles', {
+          name: vals.name, category: vals.category, model_id: vals.model_id || undefined,
+          description: vals.description, prompt_template: vals.prompt_template,
+          negative_prompt: vals.negative_prompt, tags: vals.tags.split(',').map(s => s.trim()).filter(Boolean),
+          visibility: vals.visibility, params: {}
+        });
+        toast('风格已创建', 'ok');
+        const res = await API.get('/styles'); this.state.styles = res.items; this.renderGrid();
+      }
     });
-    if (vals) {
-      await API.post('/styles', {
-        name: vals.name, category: vals.category, model_id: vals.model_id || undefined,
-        description: vals.description, prompt_template: vals.prompt_template,
-        negative_prompt: vals.negative_prompt, tags: vals.tags.split(',').map(s => s.trim()).filter(Boolean),
-        visibility: vals.visibility, params: {}
-      });
-      toast('风格已创建', 'ok');
-      const res = await API.get('/styles'); this.state.styles = res.items; this.renderGrid();
-    }
   },
 
   async editStyle(id) {
@@ -231,16 +240,16 @@ const StylesView = {
         { key: 'tags', label: '标签(逗号分隔)', value: (s.tags || []).join(', ') },
         { key: 'visibility', label: '可见性', type: 'select', options: [{ value: 'public', label: '公开' }, { value: 'private', label: '私有' }], value: s.visibility }
       ],
-      submitText: '保存'
+      submitText: '保存',
+      onSubmit: async (vals) => {
+        await API.patch('/styles/' + id, {
+          name: vals.name, category: vals.category, model_id: vals.model_id || undefined,
+          description: vals.description, prompt_template: vals.prompt_template,
+          negative_prompt: vals.negative_prompt, tags: vals.tags.split(',').map(s => s.trim()).filter(Boolean), visibility: vals.visibility
+        });
+        toast('已更新', 'ok');
+        const res = await API.get('/styles'); this.state.styles = res.items; this.renderGrid();
+      }
     });
-    if (vals) {
-      await API.patch('/styles/' + id, {
-        name: vals.name, category: vals.category, model_id: vals.model_id || undefined,
-        description: vals.description, prompt_template: vals.prompt_template,
-        negative_prompt: vals.negative_prompt, tags: vals.tags.split(',').map(s => s.trim()).filter(Boolean), visibility: vals.visibility
-      });
-      toast('已更新', 'ok');
-      const res = await API.get('/styles'); this.state.styles = res.items; this.renderGrid();
-    }
   }
 };

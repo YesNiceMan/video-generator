@@ -34,6 +34,7 @@ app.use('/api/assets', require('./api/assets'));
 app.use('/api/styles', require('./api/styles'));
 app.use('/api/tasks', require('./api/tasks'));
 app.use('/api/images', require('./api/images')); // 第二十五轮:AI 生图
+app.use('/api/text', require('./api/text'));     // 第四十二轮:文本模型(剧本处理)
 app.use('/api/credits', require('./api/credits'));
 app.use('/api', require('./api/projects'));
 app.use('/api/admin', require('./api/admin'));
@@ -43,15 +44,14 @@ app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
 // 签名素材直链:供 Agnes 等在线视频服务公网拉取本站图片(限时 HMAC 令牌,见 server/agnes.js)
 const { verifyAssetToken } = require('./agnes');
 const { db } = require('./db');
-const fs = require('fs');
+const storage = require('./storage');
 app.get('/api/open/assets/:id/file', (req, res) => {
   const { exp, sig } = req.query;
   if (!verifyAssetToken(req.params.id, exp, sig)) return res.status(403).json({ error: '签名无效或已过期' });
   const a = db.prepare('SELECT * FROM assets WHERE id=?').get(req.params.id);
-  if (!a || !fs.existsSync(a.path)) return res.status(404).json({ error: '资产不存在' });
-  res.setHeader('Content-Type', a.mime || 'application/octet-stream');
+  if (!a) return res.status(404).json({ error: '资产不存在' });
   res.setHeader('Cache-Control', 'private, max-age=600');
-  fs.createReadStream(a.path).pipe(res);
+  storage.streamFile(res, a.path, { mime: a.mime });
 });
 
 // 静态资源(前端)
@@ -65,6 +65,7 @@ app.use((err, req, res, next) => {
 });
 
 // 任务队列恢复与启动
+storage.migrateStoredPaths();
 recover();
 pump();
 setInterval(pump, 2000).unref();

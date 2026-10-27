@@ -246,6 +246,9 @@ const App = {
     if (!this.user) { this.showAuth(); return; }
     this.clearContext();
     this.setImmersive(false);
+    /* 右击菜单挂在 body 上,只靠「下一次点击」自毁;换路由往往没有点击(前进/后退、⌘K 跳转),
+       不主动收掉就会飘到下一个页面盖上内容。 */
+    document.querySelectorAll('.ctx-menu').forEach(x => x.remove());
     let hash = location.hash || '#/';
     let path = hash.replace(/^#/, '') || '/';
     let segs = path.split('/').filter(Boolean);
@@ -264,12 +267,14 @@ const App = {
     else if (segs[0] === 'assets') { view = AssetsView; }
     else if (segs[0] === 'styles') { view = StylesView; }
     else if (segs[0] === 'images') { view = ImagesView; }
-    else if (segs[0] === 'admin') { view = AdminView; }
+    else if (segs[0] === 'admin') { view = AdminView; params = { tab: segs[1] || '' }; }
     else { view = DashboardView; }
 
     document.querySelectorAll('.top-link').forEach(n => {
       const r = n.dataset.route;
-      n.classList.toggle('active', path === r || (r === '/projects' && segs[0] === 'projects'));
+      /* 子路径(#/admin/tasks、#/projects/xx)也要让顶部导航保持高亮 */
+      n.classList.toggle('active', path === r || (r === '/projects' && segs[0] === 'projects')
+        || (r === '/admin' && segs[0] === 'admin'));
     });
     /* 主导航收起时把当前页面名放进「导航」按钮，避免用户失去位置感 */
     const cur = document.querySelector('.top-link.active');

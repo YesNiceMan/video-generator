@@ -19,6 +19,25 @@ function fmtBytes(n) {
   return (i === 0 ? n : n.toFixed(1)) + ' ' + units[i];
 }
 
+/* 免费额度余量文案(第三十九轮):额度登记在模型规则 rules.quota,
+   已用量按平台内成功任务统计。未登记额度的免费模型返回空串(仍显示「免费」)。 */
+function freeQuotaText(m) {
+  const q = m && m.free_quota;
+  if (!q || !q.declared) return '';
+  return '剩 ' + q.remaining + '/' + q.total + (q.unit_text || '');
+}
+
+/* 模型下拉项统一文案:名称 + 免费标注(+ 额度余量),复用既有选项文本,不新增界面占位。
+   名称里已含「免费」的(如「百炼 Qwen-Image 3.0（免费额度）」)不再重复标注 ——
+   下拉宽度有限,重复后缀会把余量挤出可见区。 */
+function modelOptionLabel(m) {
+  const name = String((m && m.name) || '');
+  if (!m || !m.is_free) return name;
+  const q = freeQuotaText(m);
+  if (name.indexOf('免费') >= 0) return q ? name + ' · ' + q : name;
+  return name + '(免费' + (q ? ' · ' + q : '') + ')';
+}
+
 function fmtTime(ts) {
   if (!ts) return '—';
   const d = new Date(ts);
@@ -38,6 +57,28 @@ function fmtAgo(ts) {
   if (diff < 3600e3) return Math.floor(diff / 60e3) + ' 分钟前';
   if (diff < 86400e3) return Math.floor(diff / 3600e3) + ' 小时前';
   return Math.floor(diff / 86400e3) + ' 天前';
+}
+
+/* 上游网关的失败原因经常是一整坨响应体 JSON,直接铺进成果卡片就成了一屏代码。
+   先抠出 message/detail 这类人话字段,抠不到就按「上游返回 status=queued」概括,
+   再退化成截断原文。完整内容留在 title 里,详情面板仍显示原始串。 */
+function errBrief(s, max = 90) {
+  const raw = String(s == null ? '' : s).trim();
+  if (!raw) return '';
+  let txt = raw;
+  if (/^[{[]/.test(raw)) {
+    try {
+      const j = JSON.parse(raw);
+      const o = Array.isArray(j) ? j[0] : j;
+      const msg = [o && o.error && o.error.message, o && o.error && o.error.msg, o && o.message,
+        o && o.msg, o && o.detail, typeof (o && o.error) === 'string' ? o.error : null]
+        .find(v => typeof v === 'string' && v.trim());
+      const st = o && (o.status || (o.data && o.data[0] && o.data[0].status));
+      txt = msg || (st ? `上游返回 status=${st}，未产出结果` : raw);
+    } catch (e) { /* 不是合法 JSON:按原文走截断 */ }
+  }
+  txt = txt.replace(/\s+/g, ' ').trim();
+  return txt.length > max ? txt.slice(0, max) + '…' : txt;
 }
 
 function toast(msg, type = 'info', ms = 3200) {
@@ -227,6 +268,23 @@ function contextMenu(e, items) {
 
 /* ---------- 列表分页(项目优化 26·1):资源/素材类列表统一每页 20 条 ---------- */
 const PAGE_SIZE = 20;
+
+/* 列数算式与 CSS 的 repeat(auto-fill, minmax(var(--card-min), 1fr)) 保持一致:
+   每页排满整数行,20 条按 6 列排剩 4 个空格的问题就没了(32·需求三十一续) */
+const PAGE_ROWS = 4;
+function gridCols(el, minVar) {
+  if (!el) return 0;
+  const w = el.clientWidth; if (!w) return 0;
+  const root = getComputedStyle(document.documentElement);
+  const min = parseFloat(root.getPropertyValue(minVar)) || 220;
+  const cs = getComputedStyle(el);
+  const gap = parseFloat(cs.columnGap || cs.gap) || 20;
+  return Math.max(1, Math.floor((w + gap) / (min + gap)));
+}
+function gridPageSize(el, minVar, fallback) {
+  const n = gridCols(el, minVar);
+  return n >= 2 ? n * PAGE_ROWS : (fallback || PAGE_SIZE);
+}
 
 /* 把分页控件画进 box:共 N 条 · 第 x/y 页 · 上一页/页码/下一页
    只有一页时清空控件(不留常驻占位)。o = { page, pageSize, total, onPage } */

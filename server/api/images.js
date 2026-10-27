@@ -7,8 +7,10 @@ const { Router } = require('express');
 const { requireAuth } = require('../auth');
 const { asyncRoute, httpError, uid, now, clamp } = require('../util');
 const { db, getSettings } = require('../db');
+const storage = require('../storage');
 const { enqueue, pump } = require('../worker');
 const credits = require('../credits');
+const { quotaIndex } = require('../quota');
 const { parseRules, normalizeRules, modelCaps, sizeFromRatio, sizeToWH,
   snapTier, snapAspect, resolutionToPx, sizeModeOf, tiersOf, ratiosOf, imageSpecMeta } = require('../imagegen');
 
@@ -29,7 +31,7 @@ function perImagePrice(model) {
 /* 图片资产简要信息(给前端渲染缩略图) */
 function assetBrief(id) {
   if (!id) return null;
-  return db.prepare('SELECT id,type,name,thumb_path,width,height FROM assets WHERE id=?').get(id) || null;
+  return storage.assetBrief(db.prepare('SELECT id,type,name,thumb_path,width,height FROM assets WHERE id=?').get(id)) || null;
 }
 
 function gcd(a, b) { return b ? gcd(b, a % b) : a; }
@@ -275,23 +277,26 @@ r.post('/generate', asyncRoute(async (req, res) => {
 
 /* 生图模型列表(仅启用;Key 不回传明文) */
 r.get('/models', asyncRoute(async (req, res) => {
-  const rows = db.prepare("SELECT * FROM models WHERE type='text-to-image' AND enabled=1 ORDER BY created_at").all()
-    .map(m => ({
-      ...m,
-      params_schema: JSON.parse(m.params_schema || '[]'),
-      rules: parseRules(m),
-      /* protocol / caps / supported_sizes / size_mode / res_tiers / ratio_options
-         —— 前端渲染比例与分辨率下拉的唯一依据 */
-      ...imageSpecMeta(m),
-      api_key: undefined, has_api_key: !!m.api_key, api_key_tail: m.api_key ? m.api_key.slice(-4) : '',
-      price_per_image: perImagePrice(m) /* 第二十七轮:模型价优先,供前端费用提示 */
-    }));
+  const all = db.prepare("SELECT * FROM models WHERE type='text-to-image' AND enabled=1 ORDER BY created_at").all();
+  /* 免费额度余量(第三十九轮):登记在 rules.quota,已用量按平台内成功任务统计 */
+  const qIdx = quotaIndex(all);
+  const rows = all.map(m => ({
+    ...m,
+    params_schema: JSON.parse(m.params_schema || '[]'),
+    rules: parseRules(m),
+    /* protocol / caps / supported_sizes / size_mode / res_tiers / ratio_options
+       —— 前端渲染比例与分辨率下拉的唯一依据 */
+    ...imageSpecMeta(m),
+    free_quota: qIdx.get(m.id) || (m.is_free ? { declared: false } : null),
+    api_key: undefined, has_api_key: !!m.api_key, api_key_tail: m.api_key ? m.api_key.slice(-4) : '',
+    price_per_image: perImagePrice(m) /* 第二十七轮:模型价优先,供前端费用提示 */
+  }));
   res.json({ items: rows, perImage: perImagePrice(null) });
 }));
 
 /* 资产简要信息(生图完成后供分镜工作台快速把结果图加入参考资产) */
 r.get('/assets/:id', asyncRoute(async (req, res) => {
-  const a = db.prepare('SELECT id,type,name,thumb_path,width,height FROM assets WHERE id=?').get(String(req.params.id));
+  const a = storage.assetBrief(db.prepare('SELECT id,type,name,thumb_path,width,height FROM assets WHERE id=?').get(String(req.params.id)));
   if (!a) throw httpError(404, '资产不存在');
   const full = db.prepare('SELECT owner_id FROM assets WHERE id=?').get(a.id);
   if (full.owner_id !== req.user.id && !db.prepare('SELECT 1 FROM asset_shares WHERE asset_id=? AND user_id=?').get(a.id, req.user.id)) {

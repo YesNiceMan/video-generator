@@ -14,14 +14,23 @@ r.get('/models', asyncRoute(async (req, res) => {
   const sql = isAdmin ? 'SELECT * FROM models ORDER BY created_at' : 'SELECT * FROM models WHERE enabled=1 ORDER BY created_at';
   const { parseRules, detectProtocol } = require('../adapters');
   const img = require('../imagegen');
-  const rows = db.prepare(sql).all().map(m => {
+  const txt = require('../textgen');
+  const { quotaIndex } = require('../quota');
+  const all = db.prepare(sql).all();
+  /* 免费额度余量(第三十九轮):一次统计全部模型的「平台内已消耗」 */
+  const qIdx = quotaIndex(all);
+  const rows = all.map(m => {
     /* 生图模型按生图协议暴露能力 / 档位 / 尺寸形态:分镜工作台的快捷生图与生图页共用这份模型表,
        此前只带视频适配器的 protocol 且没有 caps,弹窗里连「参考图」都不出现 */
     const isImg = m.type === 'text-to-image';
+    /* 文本模型(第四十二轮)同样不能走视频适配器探测,否则后台会把 openai-chat 标成 Agnes/openai-video */
+    const isText = m.type === 'text-generation';
     return {
       ...m, params_schema: JSON.parse(m.params_schema || '[]'),
-      rules: parseRules(m), protocol: isImg ? undefined : detectProtocol(m),
+      rules: parseRules(m),
+      protocol: isImg ? undefined : (isText ? txt.detectProtocol(m) : detectProtocol(m)),
       ...(isImg ? img.imageSpecMeta(m) : {}),
+      free_quota: qIdx.get(m.id) || (m.is_free ? { declared: false } : null),
       api_key: undefined, has_api_key: !!m.api_key, api_key_tail: m.api_key ? m.api_key.slice(-4) : ''
     };
   });
