@@ -81,6 +81,7 @@ const CmdK = {
     const pages = [
       mkPage('首页 · 创作概览', '/', 'layout-dashboard'),
       mkPage('项目分集', '/projects', 'film'),
+      mkPage('短剧工作流', '/workflow', 'scroll-text', '剧本 → 分析 → 分镜 → 画风 → 下发'),
       mkPage('资产库', '/assets', 'folder-open'),
       mkPage('风格库', '/styles', 'palette'),
       mkPage('AI 生图', '/images', 'image-plus')
@@ -95,6 +96,7 @@ const CmdK = {
     }));
     const acts = [
       { group: '快速操作', label: '新建项目', sub: '创建剧集项目并获得邀请码', ico: 'plus', run: () => CmdK.actNewProject() },
+      { group: '快速操作', label: '新建短剧工作流', sub: '贴剧本 → 分析人物与分镜', ico: 'scroll-text', run: () => { location.hash = '#/workflow'; setTimeout(() => DramaView.createDrama(), 320); } },
       { group: '快速操作', label: '上传素材到资产库', sub: '图片 / 视频 / 音频', ico: 'upload', run: () => { location.hash = '#/assets'; setTimeout(() => AssetsView.showUploadDialog(), 260); } },
       { group: '快速操作', label: '打开积分中心', sub: () => '余额 ' + ((App.user && App.user.credits) || 0), ico: 'coins', run: () => CreditCenter.open() },
       { group: '快速操作', label: '查看通知', sub: '未读消息与任务提醒', ico: 'bell', run: () => App.toggleNotifs() },

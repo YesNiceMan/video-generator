@@ -12,21 +12,14 @@ const { enqueue, pump } = require('../worker');
 const credits = require('../credits');
 const { quotaIndex } = require('../quota');
 const { parseRules, normalizeRules, modelCaps, sizeFromRatio, sizeToWH,
-  snapTier, snapAspect, resolutionToPx, sizeModeOf, tiersOf, ratiosOf, imageSpecMeta } = require('../imagegen');
+  snapTier, snapAspect, resolutionToPx, sizeModeOf, tiersOf, ratiosOf, imageSpecMeta,
+  deriveSize, snapSize } = require('../imagegen');
 
 const r = Router();
 r.use(requireAuth);
 
-/* 生图单价(积分/张):免费模型 0;模型设置过积分消耗(credit_per_second 字段,生图模型即「每张价格」)优先用模型价;否则系统设置 creditPerImage(默认 2)(第二十七轮) */
-function perImagePrice(model) {
-  if (model && model.is_free) return 0;
-  if (model) {
-    const mp = Math.max(0, Number(model.credit_per_second) || 0);
-    if (mp > 0) return Math.round(mp * 100) / 100;
-  }
-  const s = getSettings();
-  return Math.max(0, Number(s.creditPerImage ?? 2));
-}
+/* 生图单价见 server/credits.js 的 imagePrice(第五十轮提到公共层,短剧工作流共用同一价格口径) */
+const perImagePrice = credits.imagePrice;
 
 /* 图片资产简要信息(给前端渲染缩略图) */
 function assetBrief(id) {
@@ -58,43 +51,11 @@ function schemaSizeOptions(model) {
   return null;
 }
 
-/* 分辨率档 × 画幅比例 → 具体尺寸。
-   短边 = 分辨率档,长边按真实比例换算(此前非方形一律按 ×1.5,导致选 16:9 还是 4:3 出的图一样大),
-   再取偶数并把长边压到 4096 以内。 */
-function deriveSize(ratio, resolution) {
-  let short = resolutionToPx(resolution) || 1024;
-  short = Math.max(64, Math.min(4096, short));
-  const m = /^([0-9.]+)\s*[:x/／]\s*([0-9.]+)$/.exec(String(ratio || '').trim());
-  let rw = 1, rh = 1;
-  if (m) {
-    const a = parseFloat(m[1]), b = parseFloat(m[2]);
-    if (a > 0 && b > 0) { rw = a; rh = b; }
-  }
-  let w = rw >= rh ? short * rw / rh : short;
-  let h = rw >= rh ? short : short * rh / rw;
-  const over = Math.max(w, h) / 4096;
-  if (over > 1) { w /= over; h /= over; }
-  const even = v => Math.max(16, Math.round(v / 2) * 2);
-  return even(w) + 'x' + even(h);
-}
+/* 分辨率档 × 画幅比例 → 具体尺寸、以及向模型清单的就近吸附,已提到 server/imagegen.js
+   (deriveSize / snapSize),AI 生图与短剧工作流批量下发共用同一换算口径。 */
 
 /* 尺寸表达形态 / 档位与画幅清单由 server/imagegen.js 的 imageSpecMeta 统一给出
    (模板含 <size> = 像素网关,否则 = 档位网关,如 Agnes images:size=1K/2K/4K + ratio=16:9) */
-
-function orientOf(wh) { return wh.w === wh.h ? 'sq' : (wh.w > wh.h ? 'l' : 'p'); }
-
-/* 在候选尺寸清单里就近吸附:先同方向(横/竖/方),再按面积就近;'auto' 等无法解析的项跳过 */
-function snapSize(candidates, wantSize) {
-  const wh = sizeToWH(wantSize);
-  if (!wh) return (candidates && candidates.length ? candidates[0] : wantSize);
-  const area = wh.w * wh.h;
-  const parsed = (candidates || []).map(s => ({ s, wh: sizeToWH(s) })).filter(x => x.wh);
-  if (!parsed.length) return wantSize;
-  const sameOrient = parsed.filter(x => orientOf(x.wh) === orientOf(wh));
-  const pool = sameOrient.length ? sameOrient : parsed;
-  pool.sort((a, b) => Math.abs(a.wh.w * a.wh.h - area) - Math.abs(b.wh.w * b.wh.h - area));
-  return pool[0].s;
-}
 
 /* 解析最终尺寸:
  * ① 旧路径:客户端显式给 size → 在 schema/协议清单内收敛;

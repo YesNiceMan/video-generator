@@ -13,6 +13,17 @@ function pricing() {
   };
 }
 
+/* 生图单价(积分/张):免费模型 0;模型设置过积分消耗(credit_per_second 字段,生图模型即「每张价格」)优先用模型价;否则系统设置 creditPerImage(默认 2)
+   第五十轮从 api/images.js 提到这里 —— 短剧工作流批量下发要按同一价格算账,不能两处各写一遍 */
+function imagePrice(model) {
+  if (model && model.is_free) return 0;
+  if (model) {
+    const mp = Math.max(0, Number(model.credit_per_second) || 0);
+    if (mp > 0) return Math.round(mp * 100) / 100;
+  }
+  return Math.max(0, Number(getSettings().creditPerImage ?? 2));
+}
+
 /* 计算某段时长的任务消耗积分数
    优先级:免费模型恒 0 → 模型专属每秒单价(后台模型管理设置,>0 时生效) → 段时长覆盖价 → 全局每秒单价向上取整 */
 function computeCost(durationSec, model) {
@@ -64,4 +75,4 @@ function refundTask(taskId, reasonPrefix) {
   return true;
 }
 
-module.exports = { pricing, computeCost, getBalance, deduct, grant, refundTask, log };
+module.exports = { pricing, computeCost, imagePrice, getBalance, deduct, grant, refundTask, log };

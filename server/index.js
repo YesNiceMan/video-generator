@@ -35,6 +35,7 @@ app.use('/api/styles', require('./api/styles'));
 app.use('/api/tasks', require('./api/tasks'));
 app.use('/api/images', require('./api/images')); // 第二十五轮:AI 生图
 app.use('/api/text', require('./api/text'));     // 第四十二轮:文本模型(剧本处理)
+app.use('/api/drama', require('./api/drama'));   // 第五十轮:短剧工作流(剧本 → 分析 → 分镜 → 画风 → 下发)
 app.use('/api/credits', require('./api/credits'));
 app.use('/api', require('./api/projects'));
 app.use('/api/admin', require('./api/admin'));

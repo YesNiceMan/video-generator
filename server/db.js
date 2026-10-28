@@ -4,6 +4,7 @@ const { DatabaseSync } = require('node:sqlite');
 const path = require('path');
 const fs = require('fs');
 const bcrypt = require('bcryptjs');
+const { uid } = require('./util');
 
 /* 可用 DATA_DIR 覆盖:回归测试要跑独立的队列副本,避免和常驻服务抢同一张 tasks 表 */
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, '..', 'data');
@@ -211,6 +212,99 @@ function migrate() {
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
   );
+
+  /* ---------- 短剧工作流(第五十轮 · 需求三十) ----------
+     dramas 是一部剧的一次生产;实体卡与分镜都是真实数据行(不像分镜工作台那样堆在
+     一段 JSON 里),这样分页、筛选、批量下发和后台统计才有落点。 */
+  CREATE TABLE IF NOT EXISTS dramas (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    project_id TEXT,
+    title TEXT NOT NULL DEFAULT '未命名短剧',
+    brief TEXT DEFAULT '',
+    script TEXT DEFAULT '',
+    script_chars INTEGER NOT NULL DEFAULT 0,
+    style TEXT DEFAULT '',
+    text_model_id TEXT DEFAULT '',
+    image_model_id TEXT DEFAULT '',
+    video_model_id TEXT DEFAULT '',
+    aspect_ratio TEXT DEFAULT '16:9',
+    image_resolution TEXT DEFAULT '1K',
+    video_resolution TEXT DEFAULT '720p',
+    fps REAL NOT NULL DEFAULT 24,
+    shot_duration REAL NOT NULL DEFAULT 10,
+    status TEXT NOT NULL DEFAULT 'draft',
+    stage TEXT DEFAULT '',
+    progress INTEGER NOT NULL DEFAULT 0,
+    done_episodes TEXT DEFAULT '[]',
+    error TEXT,
+    stats TEXT DEFAULT '{}',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_dramas_owner ON dramas(owner_id, created_at);
+
+  CREATE TABLE IF NOT EXISTS drama_entities (
+    id TEXT PRIMARY KEY,
+    drama_id TEXT NOT NULL REFERENCES dramas(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL DEFAULT 'character',
+    name TEXT NOT NULL,
+    age_stage TEXT DEFAULT '',
+    costume TEXT DEFAULT '',
+    profile TEXT DEFAULT '',
+    prompt TEXT DEFAULT '',
+    asset_id TEXT,
+    note TEXT DEFAULT '',
+    sort_index INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_drama_entities ON drama_entities(drama_id, kind, sort_index);
+
+  CREATE TABLE IF NOT EXISTS drama_shots (
+    id TEXT PRIMARY KEY,
+    drama_id TEXT NOT NULL REFERENCES dramas(id) ON DELETE CASCADE,
+    episode_no INTEGER NOT NULL DEFAULT 1,
+    shot_no INTEGER NOT NULL DEFAULT 0,
+    script_text TEXT DEFAULT '',
+    image_prompt TEXT DEFAULT '',
+    video_prompt TEXT DEFAULT '',
+    duration REAL NOT NULL DEFAULT 10,
+    scene_ref TEXT DEFAULT '',
+    char_refs TEXT DEFAULT '[]',
+    end_state TEXT DEFAULT '',
+    ref_asset_ids TEXT DEFAULT '[]',
+    ref_exclude_ids TEXT DEFAULT '[]',
+    image_locked INTEGER NOT NULL DEFAULT 0,
+    use_cast_refs INTEGER NOT NULL DEFAULT 1,
+    fps REAL NOT NULL DEFAULT 0,
+    video_resolution TEXT DEFAULT '',
+    image_task_ids TEXT DEFAULT '[]',
+    video_task_ids TEXT DEFAULT '[]',
+    image_asset_ids TEXT DEFAULT '[]',
+    video_asset_ids TEXT DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'pending',
+    sort_index INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_drama_shots ON drama_shots(drama_id, episode_no, shot_no);
+
+  CREATE TABLE IF NOT EXISTS prompt_presets (
+    id TEXT PRIMARY KEY,
+    style_name TEXT NOT NULL,
+    slot TEXT NOT NULL,
+    region TEXT DEFAULT '',
+    content TEXT DEFAULT '',
+    negative TEXT DEFAULT '',
+    note TEXT DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    is_system INTEGER NOT NULL DEFAULT 0,
+    sort_index INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_presets_style ON prompt_presets(style_name, slot, sort_index);
   `);
 
   // 增量迁移:为已存在的数据库补充 episodes.script 列
@@ -243,6 +337,32 @@ function migrate() {
   if (!taskCols.includes('result_asset_ids')) db.exec("ALTER TABLE tasks ADD COLUMN result_asset_ids TEXT DEFAULT '[]'");
   /* 视频网关排队已满(video_queue_full)时任务延后重投的时间点,NULL 表示立即可取 */
   if (!taskCols.includes('next_at')) db.exec('ALTER TABLE tasks ADD COLUMN next_at INTEGER');
+  /* 第五十轮(短剧工作流):批量下发的任务回指所属剧集,工作流页据此查进度,
+     和 project_id / episode_id 一样是纯标记列(不加外键,删剧集不牵连历史任务) */
+  if (!taskCols.includes('drama_id')) db.exec("ALTER TABLE tasks ADD COLUMN drama_id TEXT DEFAULT ''");
+  if (taskCols.includes('drama_id') && !db.prepare("SELECT 1 FROM pragma_index_list('tasks') WHERE name='idx_tasks_drama'").get()) {
+    db.exec('CREATE INDEX IF NOT EXISTS idx_tasks_drama ON tasks(drama_id)');
+  }
+  /* 第五十轮补:出片规格要能改 —— 此前工作流下发时尺寸写死「模型第一档 + 16:9」。
+     剧级一套(默认沿用关联项目),单镜可覆盖时长/帧率/视频分辨率(0 或空 = 跟随剧级)。 */
+  const dramaCols = db.prepare("SELECT name FROM pragma_table_info('dramas')").all().map(r => r.name);
+  if (!dramaCols.includes('aspect_ratio')) db.exec("ALTER TABLE dramas ADD COLUMN aspect_ratio TEXT DEFAULT '16:9'");
+  if (!dramaCols.includes('image_resolution')) db.exec("ALTER TABLE dramas ADD COLUMN image_resolution TEXT DEFAULT '1K'");
+  if (!dramaCols.includes('video_resolution')) db.exec("ALTER TABLE dramas ADD COLUMN video_resolution TEXT DEFAULT '720p'");
+  if (!dramaCols.includes('fps')) db.exec('ALTER TABLE dramas ADD COLUMN fps REAL NOT NULL DEFAULT 24');
+  if (!dramaCols.includes('shot_duration')) db.exec('ALTER TABLE dramas ADD COLUMN shot_duration REAL NOT NULL DEFAULT 10');
+  const shotCols = db.prepare("SELECT name FROM pragma_table_info('drama_shots')").all().map(r => r.name);
+  if (!shotCols.includes('ref_asset_ids')) db.exec("ALTER TABLE drama_shots ADD COLUMN ref_asset_ids TEXT DEFAULT '[]'");
+  if (!shotCols.includes('use_cast_refs')) db.exec('ALTER TABLE drama_shots ADD COLUMN use_cast_refs INTEGER NOT NULL DEFAULT 1');
+  if (!shotCols.includes('fps')) db.exec('ALTER TABLE drama_shots ADD COLUMN fps REAL NOT NULL DEFAULT 0');
+  if (!shotCols.includes('video_resolution')) db.exec("ALTER TABLE drama_shots ADD COLUMN video_resolution TEXT DEFAULT ''");
+  /* 地域:海外/国内画风要约束画面元素与台词语言(第五十轮 · 需求七) */
+  const presetCols = db.prepare("SELECT name FROM pragma_table_info('prompt_presets')").all().map(r => r.name);
+  if (!presetCols.includes('region')) db.exec("ALTER TABLE prompt_presets ADD COLUMN region TEXT DEFAULT ''");
+  /* 自动来源的参考图要能单独摘掉:排除表与自动来源分开存,自动补全时才不会立刻又长回来 */
+  if (!shotCols.includes('ref_exclude_ids')) db.exec("ALTER TABLE drama_shots ADD COLUMN ref_exclude_ids TEXT DEFAULT '[]'");
+  /* 图片提示词改为派生(场景卡底稿 + 本镜画面);只有「组装预览→固定为底稿」过的镜才锁定为人工版本 */
+  if (!shotCols.includes('image_locked')) db.exec('ALTER TABLE drama_shots ADD COLUMN image_locked INTEGER NOT NULL DEFAULT 0');
   const modelCols = db.prepare("SELECT name FROM pragma_table_info('models')").all().map(r => r.name);
   if (!modelCols.includes('is_free')) db.exec('ALTER TABLE models ADD COLUMN is_free INTEGER NOT NULL DEFAULT 0');
   if (!modelCols.includes('check_status')) db.exec("ALTER TABLE models ADD COLUMN check_status TEXT NOT NULL DEFAULT 'unknown'");
@@ -549,6 +669,31 @@ function seed() {
   if (!Array.isArray(s.videoResolutions) || !s.videoResolutions.length) setSetting('videoResolutions', ['480p', '720p', '960p', '2k']);
   /* 第二十五轮(AI 生图):每张图片积分定价(免费生图模型恒为 0) */
   if (s.creditPerImage === undefined) setSetting('creditPerImage', 2);
+
+  /* 第五十轮(短剧工作流):内置画风全局提示词只种一次。
+     用设置位而不是「表空即种」—— 用户清空画风库后不该在下次启动又自动长回来,
+     想恢复走工作流页的「恢复内置画风」。 */
+  if (!getSettings().dramaPresetsSeeded) {
+    const { PRESETS } = require('./drama-presets');
+    const ins = db.prepare(`INSERT INTO prompt_presets(id,style_name,slot,region,content,negative,note,enabled,is_system,sort_index,created_at)
+      VALUES(?,?,?,?,?,?,?,1,1,?,?)`);
+    let n = 0;
+    for (let i = 0; i < PRESETS.length; i++) {
+      const p = PRESETS[i];
+      ins.run(uid('pm-'), p.style, p.slot, p.region || '', p.content, p.negative || '', p.note || '', i, now);
+      n++;
+    }
+    setSetting('dramaPresetsSeeded', n);
+    console.log('[种子] 内置画风全局提示词 ' + n + ' 条');
+  }
+  /* 地域属性后加(需求七):已存在的内置画风按「画风+槽位」补上,用户自己改过的不动 */
+  {
+    const { PRESETS } = require('./drama-presets');
+    const upd = db.prepare("UPDATE prompt_presets SET region=? WHERE style_name=? AND slot=? AND (region IS NULL OR region='') AND ?<>''");
+    let n = 0;
+    for (const p of PRESETS) if (p.region) n += Number(upd.run(p.region, p.style, p.slot, p.region).changes || 0);
+    if (n) console.log('[迁移] 内置画风补地域属性 ' + n + ' 条');
+  }
 }
 
 migrate();

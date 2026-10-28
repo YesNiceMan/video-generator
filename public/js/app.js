@@ -265,6 +265,8 @@ const App = {
     else if (segs[0] === 'projects' && segs[1]) { view = ProjectsView; params = { id: segs[1] }; }
     else if (segs[0] === 'projects') { view = ProjectsView; }
     else if (segs[0] === 'assets') { view = AssetsView; }
+    else if (segs[0] === 'workflow' && segs[1]) { view = DramaView; params = { id: segs[1], stage: segs[2] || 'script' }; }
+    else if (segs[0] === 'workflow') { view = DramaView; }
     else if (segs[0] === 'styles') { view = StylesView; }
     else if (segs[0] === 'images') { view = ImagesView; }
     else if (segs[0] === 'admin') { view = AdminView; params = { tab: segs[1] || '' }; }
@@ -274,6 +276,7 @@ const App = {
       const r = n.dataset.route;
       /* 子路径(#/admin/tasks、#/projects/xx)也要让顶部导航保持高亮 */
       n.classList.toggle('active', path === r || (r === '/projects' && segs[0] === 'projects')
+        || (r === '/workflow' && segs[0] === 'workflow')
         || (r === '/admin' && segs[0] === 'admin'));
     });
     /* 主导航收起时把当前页面名放进「导航」按钮，避免用户失去位置感 */

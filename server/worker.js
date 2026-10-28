@@ -109,7 +109,7 @@ function notify(userId, title, body, taskId) {
     .run(uid('n-'), userId, 'task', title, body, taskId || null, now());
 }
 
-/* 生图结果资产入库:source='imggen',分类默认「分镜」;返回资产 ID */
+/* 生图结果资产入库:source='imggen',分类跟随任务声明(params.asset_category,短剧工作流按角色/场景/分镜归类),缺省「分镜」;返回资产 ID */
 function resultImageAsset(task, filePath, idx, total) {
   const p = probe(filePath);
   const assetId = uid('a-');
@@ -125,15 +125,35 @@ function resultImageAsset(task, filePath, idx, total) {
   /* 图片缩略图:等比缩到 480 宽 */
   const { run: ffRun } = require('./ffmpeg');
   try { ffRun(['-y', '-i', stored, '-vf', 'scale=480:-2', '-frames:v', '1', '-q:v', '4', thumbPath], { timeout: 60000 }); } catch (e) { thumbPath && 0; }
+  /* 成果名用「角色卡名 / 第N集 镜M 分镜图」这类能认出来的名字,不再一律叫「AI生图_xxx」 */
+  let params0 = {};
+  try { params0 = JSON.parse(task.params || '{}'); } catch (e) { params0 = {}; }
   const suffix = total > 1 ? '_' + idx : '';
-  const name = 'AI生图_' + task.id.slice(0, 6) + suffix + '.' + ext;
+  const baseName = String(params0.asset_name || '').trim() || ('AI生图_' + task.id.slice(0, 6));
+  const name = baseName.replace(/[\\/:*?"<>|]/g, '_').slice(0, 80) + suffix + '.' + ext;
+  let category = '分镜';
+  try { category = String(params0.asset_category || '分镜'); } catch (e) { /* 参数异常按分镜入库 */ }
   db.prepare(`INSERT INTO assets(id,owner_id,folder_id,type,name,size,mime,path,thumb_path,width,height,duration,tags,category,source,created_at)
     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(assetId, task.user_id, null, 'image', name, fs.statSync(stored).size, mime, storage.toKey(stored),
       fs.existsSync(thumbPath) ? storage.toKey(thumbPath) : null, p.width, p.height, null,
-      JSON.stringify(['imggen', 'generated']), '分镜', 'imggen', now());
+      JSON.stringify(['imggen', 'generated']), category, 'imggen', now());
   db.prepare('UPDATE users SET storage_used = storage_used + ? WHERE id=?').run(fs.statSync(stored).size, task.user_id);
   return assetId;
+}
+
+/* 短剧工作流成果回写(第五十轮):任务参数里带 drama_entity_id / drama_shot_id 时,
+   把产出的资产 ID 记回卡与分镜。生成进度不在这里维护 —— 前端按 tasks 表现查,
+   避免「卡上的状态」和「任务真实状态」两处各说一套。 */
+function attachDramaAssets(task, ids, kind) {
+  let p = {};
+  try { p = JSON.parse(task.params || '{}'); } catch (e) { return; }
+  if (!ids || !ids.length) return;
+  if (p.drama_entity_id) db.prepare('UPDATE drama_entities SET asset_id=?, updated_at=? WHERE id=?').run(String(ids[0]), now(), String(p.drama_entity_id));
+  if (p.drama_shot_id) {
+    const col = kind === 'video' ? 'video_asset_ids' : 'image_asset_ids';
+    db.prepare('UPDATE drama_shots SET ' + col + '=?, updated_at=? WHERE id=?').run(JSON.stringify(ids), now(), String(p.drama_shot_id));
+  }
 }
 
 function resultAsset(task, filePath) {
@@ -148,9 +168,12 @@ function resultAsset(task, filePath) {
   const thumbPath = path.join(DATA_DIR, 'thumbs', thumbId + '.jpg');
   fs.mkdirSync(path.dirname(thumbPath), { recursive: true });
   try { makeThumb(stored, thumbPath).catch(() => {}); } catch (e) {}
+  let pv = {};
+  try { pv = JSON.parse(task.params || '{}'); } catch (e) { pv = {}; }
+  const vName = (String(pv.asset_name || '').trim() || ('生成结果_' + task.id.slice(0, 6))).replace(/[\\/:*?"<>|]/g, '_').slice(0, 80) + '.mp4';
   db.prepare(`INSERT INTO assets(id,owner_id,folder_id,type,name,size,mime,path,thumb_path,width,height,duration,tags,source,created_at)
     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(assetId, task.user_id, null, 'video', `生成结果_${task.id.slice(0, 6)}.mp4`, fs.statSync(stored).size, 'video/mp4', storage.toKey(stored), storage.toKey(thumbPath), p.width, p.height, p.duration, JSON.stringify(['generated']), 'generated', now());
+    .run(assetId, task.user_id, null, 'video', vName, fs.statSync(stored).size, 'video/mp4', storage.toKey(stored), storage.toKey(thumbPath), p.width, p.height, p.duration, JSON.stringify(['generated']), 'generated', now());
   db.prepare('UPDATE users SET storage_used = storage_used + ? WHERE id=?').run(fs.statSync(stored).size, task.user_id);
   return assetId;
 }
@@ -226,6 +249,7 @@ async function processTask(task) {
       ids.push(resultImageAsset(task, files[i], i + 1, files.length));
     }
     db.prepare('UPDATE tasks SET result_asset_ids=? WHERE id=?').run(JSON.stringify(ids), task.id);
+    attachDramaAssets(task, ids, 'image');
     const firstId = ids[0];
     const durationMs0 = now() - started;
     db.prepare("UPDATE tasks SET status='completed', progress=100, result_asset_id=?, duration_ms=?, finished_at=? WHERE id=?")
@@ -256,6 +280,7 @@ async function processTask(task) {
   }
 
   const assetId = resultAsset(task, outFile);
+  attachDramaAssets(task, [assetId], 'video');
   const durationMs = now() - started;
   db.prepare("UPDATE tasks SET status='completed', progress=100, result_asset_id=?, duration_ms=?, finished_at=? WHERE id=?")
     .run(assetId, durationMs, now(), task.id);

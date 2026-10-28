@@ -871,6 +871,39 @@ async function run(model, ctx) {
   return adapter.generate({ ...ctx, rules, model });
 }
 
+/* 比例 × 分辨率档 → 具体像素(短剧工作流批量下发与 AI 生图共用,不能两处各写一套换算) */
+function deriveSize(ratio, resolution) {
+  let short = resolutionToPx(resolution) || 1024;
+  short = Math.max(64, Math.min(4096, short));
+  const m = /^([0-9.]+)\s*[:x/／]\s*([0-9.]+)$/.exec(String(ratio || '').trim());
+  let rw = 1, rh = 1;
+  if (m) {
+    const a = parseFloat(m[1]), b = parseFloat(m[2]);
+    if (a > 0 && b > 0) { rw = a; rh = b; }
+  }
+  let w = rw >= rh ? short * rw / rh : short;
+  let h = rw >= rh ? short : short * rh / rw;
+  const over = Math.max(w, h) / 4096;
+  if (over > 1) { w /= over; h /= over; }
+  const even = v => Math.max(16, Math.round(v / 2) * 2);
+  return even(w) + 'x' + even(h);
+}
+
+function orientOf(wh) { return wh.w === wh.h ? 'sq' : (wh.w > wh.h ? 'l' : 'p'); }
+
+/* 在候选尺寸清单里就近吸附:先同方向(横/竖/方),再按面积就近;'auto' 等无法解析的项跳过 */
+function snapSize(candidates, wantSize) {
+  const wh = sizeToWH(wantSize);
+  if (!wh) return (candidates && candidates.length ? candidates[0] : wantSize);
+  const area = wh.w * wh.h;
+  const parsed = (candidates || []).map(s => ({ s, wh: sizeToWH(s) })).filter(x => x.wh);
+  if (!parsed.length) return wantSize;
+  const sameOrient = parsed.filter(x => orientOf(x.wh) === orientOf(wh));
+  const pool = sameOrient.length ? sameOrient : parsed;
+  pool.sort((a, b) => Math.abs(a.wh.w * a.wh.h - area) - Math.abs(b.wh.w * b.wh.h - area));
+  return pool[0].s;
+}
+
 function listAdapters() {
   return Object.entries(ADAPTERS).map(([id, a]) => ({ id, label: a.label }));
 }
@@ -880,7 +913,7 @@ module.exports = {
   parseRules, normalizeRules, detectProtocol, errText,
   fillTemplate, sizeToWH, whToAspect, downloadImage, writeImageBuffer,
   modelCaps, sizeFromRatio, geminiAspect, snapAspect, geminiImageSize, snapTier, resolutionToPx,
-  sizeModeOf, tiersOf, ratiosOf, imageSpecMeta,
+  sizeModeOf, tiersOf, ratiosOf, imageSpecMeta, deriveSize, snapSize, orientOf,
   normalizeAsync, isQueuedResponse, fillTokens, saveOpenAiResult
 };
 
